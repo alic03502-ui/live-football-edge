@@ -1,1230 +1,361 @@
-
 from __future__ import annotations
-
-import math
-from datetime import datetime, timezone
+import json
 from typing import Any
 
+import pandas as pd
 import requests
 import streamlit as st
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+from model import (
+    REQUIRED_COLUMNS, prepare_history, model_status, pre_match_lambdas,
+    in_play_lambdas, score_matrix, markets, top_final_scores,
+    walk_forward_evaluation,
+)
+from storage import init_db, load_history, save_history, save_snapshot, recent_snapshots
 
 BASE_URL = "https://api.goal-api.com/v1"
-REQUEST_TIMEOUT = 20
+TIMEOUT = 20
+init_db()
 
-st.set_page_config(
-    page_title="Live Football Edge",
-    page_icon="⚽",
-    layout="wide",
+st.set_page_config(page_title="Live Football Edge", page_icon="⚽", layout="wide")
+st.title("⚽ Live Football Edge")
+st.caption("Live GOAL API data · Poisson baseline · historical evaluation · no bookmaker odds")
+st.warning(
+    "Probabilities are experimental until evaluated on your own historical data. "
+    "The in-play adjustment is heuristic, not a trained or calibrated live model."
 )
 
-# ============================================================
-# GOAL API CONNECTION
-# ============================================================
 
-def get_api_key() -> str:
+def get_key() -> str:
     try:
         return str(st.secrets.get("GOAL_API_KEY", "")).strip()
     except Exception:
         return ""
 
 
-def api_get(endpoint: str) -> Any:
-    key = get_api_key()
-
+def api_get(endpoint: str):
+    key = get_key()
     if not key:
-        raise RuntimeError(
-            "GOAL_API_KEY is missing from Streamlit Secrets. "
-            "Add it under your Streamlit app settings."
-        )
-
+        raise RuntimeError("GOAL_API_KEY is missing from Streamlit Secrets.")
     try:
         response = requests.get(
             f"{BASE_URL}/{endpoint.lstrip('/')}",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Accept": "application/json",
-            },
-            timeout=REQUEST_TIMEOUT,
+            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+            timeout=TIMEOUT,
         )
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            f"Could not connect to GOAL API: {exc}"
-        ) from exc
-
-    if response.status_code == 401:
-        raise RuntimeError(
-            "GOAL API rejected the key. Check GOAL_API_KEY in Streamlit Secrets."
-        )
-
-    if response.status_code == 403:
-        raise RuntimeError(
-            "GOAL API denied access. Check your plan and endpoint permissions."
-        )
-
-    if response.status_code == 429:
-        raise RuntimeError(
-            "GOAL API rate limit reached. Wait for the quota to reset."
-        )
-
-    if response.status_code >= 500:
-        raise RuntimeError(
-            f"GOAL API server error ({response.status_code}). Try again later."
-        )
-
-    try:
+        if response.status_code == 401:
+            raise RuntimeError("GOAL API rejected the key. Check Streamlit Secrets.")
+        if response.status_code == 403:
+            raise RuntimeError("GOAL API denied access or this endpoint is not in your plan.")
+        if response.status_code == 429:
+            raise RuntimeError("GOAL API quota/rate limit reached. Wait before retrying.")
         response.raise_for_status()
-        payload = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        raise RuntimeError(
-            f"GOAL API returned an invalid response: {exc}"
-        ) from exc
-
-    if isinstance(payload, dict) and payload.get("success") is False:
-        error = payload.get("error") or payload.get("message") or payload
-        raise RuntimeError(f"GOAL API error: {error}")
-
-    if isinstance(payload, dict):
-        return payload.get("data", payload)
-
-    return payload
+        data = response.json()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"GOAL API request failed: {exc}") from exc
+    if isinstance(data, dict):
+        if data.get("success") is False:
+            raise RuntimeError(str(data.get("error") or data.get("message") or "API error"))
+        return data.get("data", data)
+    return data
 
 
-def list_from_payload(payload: Any) -> list:
-    """Extract a list from common API response structures."""
+def as_list(payload: Any) -> list[dict]:
     if isinstance(payload, list):
-        return payload
-
+        return [x for x in payload if isinstance(x, dict)]
     if isinstance(payload, dict):
-        for key in (
-            "fixtures",
-            "matches",
-            "results",
-            "events",
-            "statistics",
-            "data",
-            "items",
-        ):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-
-        if any(
-            key in payload
-            for key in ("id", "fixtureId", "fixture_id", "match_id")
-        ):
+        for key in ("fixtures", "matches", "results", "events", "items", "data"):
+            if isinstance(payload.get(key), list):
+                return [x for x in payload[key] if isinstance(x, dict)]
+        if any(k in payload for k in ("id", "fixtureId", "fixture_id", "match_id")):
             return [payload]
-
     return []
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_live_fixtures() -> list:
-    payload = api_get("fixtures/live")
-    return list_from_payload(payload)
-
-
-@st.cache_data(ttl=90, show_spinner=False)
-def get_fixture_details(fixture_id: str) -> Any:
-    return api_get(f"fixtures/{fixture_id}")
-
-
-@st.cache_data(ttl=90, show_spinner=False)
-def get_fixture_statistics(fixture_id: str) -> list:
-    payload = api_get(f"fixtures/{fixture_id}/statistics")
-    return list_from_payload(payload)
-
-
-@st.cache_data(ttl=90, show_spinner=False)
-def get_fixture_events(fixture_id: str) -> list:
-    payload = api_get(f"fixtures/{fixture_id}/events")
-    return list_from_payload(payload)
-
-
-# ============================================================
-# FLEXIBLE DATA PARSING
-# ============================================================
-
-def first_value(obj: Any, *keys: str, default=None):
+def first(obj, *keys, default=None):
     if not isinstance(obj, dict):
         return default
-
     for key in keys:
-        value = obj.get(key)
-        if value is not None:
-            return value
-
+        if obj.get(key) is not None:
+            return obj[key]
     return default
 
 
-def nested(obj: Any, *keys: str) -> dict:
-    value = first_value(obj, *keys, default={})
-    return value if isinstance(value, dict) else {}
-
-
-def as_number(value):
+def parse_score(value):
+    if isinstance(value, dict):
+        value = first(value, "score", "goals", "value", "total", "current")
     if value is None or isinstance(value, bool):
         return None
+    try:
+        n = float(str(value).strip())
+        if n >= 0 and n.is_integer():
+            return int(n)
+    except (TypeError, ValueError):
+        pass
+    return None
 
-    if isinstance(value, (int, float)):
-        if math.isfinite(float(value)):
-            return float(value)
-        return None
 
+def score_for(item, side):
+    keys = (("homeTeamScore", "home_score", "homeScore", "homeGoals", "home_goals", "match_hometeam_score")
+            if side == "home" else
+            ("awayTeamScore", "away_score", "awayScore", "awayGoals", "away_goals", "match_awayteam_score"))
+    value = parse_score(first(item, *keys))
+    if value is not None:
+        return value
+    containers = ("goals", "score", "scores", "currentScore")
+    nested_keys = (("home", "homeScore", "home_score", "homeTeam", "homeTeamScore")
+                   if side == "home" else
+                   ("away", "awayScore", "away_score", "awayTeam", "awayTeamScore"))
+    for name in containers:
+        obj = item.get(name)
+        if isinstance(obj, dict):
+            value = parse_score(first(obj, *nested_keys, default=obj.get(side)))
+            if value is not None:
+                return value
+    return None
+
+
+def team_label(value, fallback):
     if isinstance(value, str):
-        cleaned = value.replace("%", "").strip()
-        try:
-            number = float(cleaned)
-            return number if math.isfinite(number) else None
-        except ValueError:
-            return None
-
-    return None
-
-
-def safe_int(value, default=0) -> int:
-    number = as_number(value)
-    return int(number) if number is not None else default
-
-
-def parse_score(value):
-    """
-    Return an integer score, or None if the score is genuinely unavailable.
-    Never convert a missing or unrecognized score to zero.
-    """
+        return value
     if isinstance(value, dict):
-        value = first_value(
-            value,
-            "score",
-            "goals",
-            "value",
-            "total",
-            "current",
-        )
-
-    number = as_number(value)
-
-    if number is None or number < 0:
-        return None
-
-    return int(number)
-
-
-def extract_score(item: dict, side: str):
-    """
-    Recognize multiple common score formats, including GOAL API's
-    homeTeamScore and awayTeamScore fields.
-    """
-    if side == "home":
-        direct_keys = (
-            "homeTeamScore",
-            "home_score",
-            "homeScore",
-            "homeGoals",
-            "home_goals",
-            "match_hometeam_score",
-            "scoreHome",
-        )
-        nested_keys = (
-            "home",
-            "homeScore",
-            "home_score",
-            "homeTeam",
-            "homeTeamScore",
-        )
-    else:
-        direct_keys = (
-            "awayTeamScore",
-            "away_score",
-            "awayScore",
-            "awayGoals",
-            "away_goals",
-            "match_awayteam_score",
-            "scoreAway",
-        )
-        nested_keys = (
-            "away",
-            "awayScore",
-            "away_score",
-            "awayTeam",
-            "awayTeamScore",
-        )
-
-    # First: explicit score fields on the fixture.
-    direct = first_value(item, *direct_keys)
-    score = parse_score(direct)
-
-    if score is not None:
-        return score
-
-    # Second: common nested score containers.
-    for container_key in ("goals", "score", "scores", "currentScore"):
-        container = item.get(container_key)
-
-        if not isinstance(container, dict):
-            continue
-
-        candidate = first_value(container, *nested_keys)
-        score = parse_score(candidate)
-
-        if score is not None:
-            return score
-
-        # Some APIs use nested structures such as {"home": {"score": 2}}.
-        if side in container:
-            score = parse_score(container[side])
-            if score is not None:
-                return score
-
-    # Third: nested fixture structures.
-    fixture = nested(item, "fixture")
-    for container_key in ("goals", "score", "scores"):
-        container = fixture.get(container_key)
-
-        if isinstance(container, dict):
-            candidate = first_value(container, *nested_keys)
-            score = parse_score(candidate)
-            if score is not None:
-                return score
-
-    return None
-
-
-def team_name(team: Any, fallback: str) -> str:
-    if isinstance(team, str):
-        return team
-
-    if isinstance(team, dict):
-        return str(
-            first_value(
-                team,
-                "name",
-                "teamName",
-                "team_name",
-                "displayName",
-                default=fallback,
-            )
-        )
-
+        return str(first(value, "name", "teamName", "team_name", "displayName", default=fallback))
     return fallback
 
 
-def team_id(team: Any):
-    if isinstance(team, dict):
-        return first_value(team, "id", "teamId", "team_id")
-    return None
-
-
-def normalise_fixture(item: dict) -> dict:
-    """
-    Normalize fixture fields. A missing score remains None instead of
-    being incorrectly displayed as 0.
-    """
-    fixture = nested(item, "fixture")
-    teams = nested(item, "teams")
-    league = nested(item, "league")
-    status = nested(item, "status", "fixtureStatus")
-
-    home = first_value(
-        teams,
-        "home",
-        "homeTeam",
-        "home_team",
-        default=first_value(
-            item,
-            "homeTeam",
-            "home_team",
-            "home",
-            default=first_value(
-                item,
-                "match_hometeam_name",
-                "homeTeamName",
-                default="Home",
-            ),
-        ),
-    )
-
-    away = first_value(
-        teams,
-        "away",
-        "awayTeam",
-        "away_team",
-        default=first_value(
-            item,
-            "awayTeam",
-            "away_team",
-            "away",
-            default=first_value(
-                item,
-                "match_awayteam_name",
-                "awayTeamName",
-                default="Away",
-            ),
-        ),
-    )
-
-    home_name = team_name(home, "Home")
-    away_name = team_name(away, "Away")
-
-    # FIX: recognize homeTeamScore / awayTeamScore and other formats.
-    home_score = extract_score(item, "home")
-    away_score = extract_score(item, "away")
-
-    minute = first_value(
-        item,
-        "matchMinute",
-        "matchElapsed",
-        "match_minute",
-        "elapsed",
-        "minute",
-        default=first_value(
-            status,
-            "elapsed",
-            "minute",
-            default=first_value(item, "match_status"),
-        ),
-    )
-
+def normalize(item):
+    teams = item.get("teams") if isinstance(item.get("teams"), dict) else {}
+    home = first(teams, "home", "homeTeam", "home_team",
+                 default=first(item, "homeTeam", "home_team", "home", "match_hometeam_name", default="Home"))
+    away = first(teams, "away", "awayTeam", "away_team",
+                 default=first(item, "awayTeam", "away_team", "away", "match_awayteam_name", default="Away"))
+    status_obj = first(item, "status", "fixtureStatus", default={})
+    minute = first(item, "matchMinute", "matchElapsed", "match_minute", "elapsed", "minute",
+                   default=first(status_obj, "elapsed", "minute", default=first(item, "match_status", default=0)))
     if isinstance(minute, str):
-        digits = ""
-        for char in minute:
-            if char.isdigit():
-                digits += char
-            elif digits:
-                break
-        minute = safe_int(digits, 0)
-
-    fixture_id = first_value(
-        item,
-        "id",
-        "fixtureId",
-        "fixture_id",
-        "match_id",
-        default=first_value(
-            fixture,
-            "id",
-            "fixtureId",
-            "fixture_id",
-        ),
-    )
-
-    league_name = first_value(
-        league,
-        "name",
-        "leagueName",
-        "league_name",
-        default=first_value(
-            item,
-            "leagueName",
-            "league_name",
-            default="Unknown league",
-        ),
-    )
-
+        import re
+        found = re.search(r"\d+", minute)
+        minute = int(found.group()) if found else 0
+    try:
+        minute = max(0, min(120, int(minute or 0)))
+    except (TypeError, ValueError):
+        minute = 0
+    league_obj = item.get("league") if isinstance(item.get("league"), dict) else {}
     return {
-        "id": str(fixture_id) if fixture_id is not None else "",
-        "home_name": home_name,
-        "away_name": away_name,
-        "home_id": team_id(home),
-        "away_id": team_id(away),
-        "home_score": home_score,
-        "away_score": away_score,
-        "minute": max(0, min(130, safe_int(minute))),
-        "league": str(league_name),
-        "status": status,
+        "id": str(first(item, "id", "fixtureId", "fixture_id", "match_id", default="")),
+        "home_name": team_label(home, "Home"),
+        "away_name": team_label(away, "Away"),
+        "home_score": score_for(item, "home"),
+        "away_score": score_for(item, "away"),
+        "minute": minute,
+        "league": str(first(league_obj, "name", "leagueName", default=first(item, "leagueName", "league_name", default="Unknown league"))),
+        "status": str(status_obj),
         "raw": item,
     }
 
 
-def normalise_stat_rows(payload: list) -> tuple[list, list]:
-    home_stats = []
-    away_stats = []
-
-    for row in payload or []:
+def stat_value(rows, *names):
+    wanted = {n.lower() for n in names}
+    for row in rows:
         if not isinstance(row, dict):
             continue
-
-        team = nested(row, "team")
-        stats = first_value(
-            row,
-            "statistics",
-            "stats",
-            "items",
-            default=[],
-        )
-
-        if isinstance(stats, list):
-            name = team_name(team, "")
-            target = None
-
-            if name.lower() in ("home", "home team"):
-                target = home_stats
-            elif name.lower() in ("away", "away team"):
-                target = away_stats
-
-            if target is not None:
-                target.extend(stats)
-
-            continue
-
-        stat_name = first_value(
-            row,
-            "type",
-            "name",
-            "statistic",
-            "label",
-        )
-        home_value = first_value(
-            row,
-            "home",
-            "homeValue",
-            "home_value",
-        )
-        away_value = first_value(
-            row,
-            "away",
-            "awayValue",
-            "away_value",
-        )
-
-        if stat_name is not None:
-            if home_value is not None:
-                home_stats.append({
-                    "type": stat_name,
-                    "value": home_value,
-                })
-            if away_value is not None:
-                away_stats.append({
-                    "type": stat_name,
-                    "value": away_value,
-                })
-
-    return home_stats, away_stats
-
-
-def stat_value(stat_list, *names):
-    wanted = {name.lower() for name in names}
-
-    for item in stat_list or []:
-        if not isinstance(item, dict):
-            continue
-
-        label = str(
-            first_value(
-                item,
-                "type",
-                "name",
-                "label",
-                "statistic",
-                default="",
-            )
-        ).lower()
-
+        label = str(first(row, "type", "name", "label", "statistic", default="")).lower()
         if label in wanted:
-            return as_number(
-                first_value(item, "value", "total", "amount")
-            )
-
+            value = first(row, "value", "total", "amount")
+            try:
+                return float(str(value).replace("%", "").strip())
+            except (TypeError, ValueError):
+                return None
     return None
 
 
-def count_red_cards(events: list, team_identifier=None, team_label=None) -> int:
-    count = 0
-
-    for event in events or []:
-        if not isinstance(event, dict):
-            continue
-
-        event_team = nested(event, "team")
-        event_team_id = team_id(event_team)
-        event_team_name = team_name(event_team, "")
-
-        if team_identifier is not None and event_team_id is not None:
-            if str(event_team_id) != str(team_identifier):
-                continue
-        elif team_label and event_team_name:
-            if event_team_name.lower() != team_label.lower():
-                continue
-
-        detail = str(
-            first_value(
-                event,
-                "detail",
-                "description",
-                "card",
-                default="",
-            )
-        ).lower()
-
-        event_type = str(
-            first_value(event, "type", "event", default="")
-        ).lower()
-
-        if "red" in detail or "red card" in event_type:
-            count += 1
-
-    return count
-
-
-def event_rows(events: list) -> list:
-    rows = []
-
-    for event in events or []:
-        if not isinstance(event, dict):
-            continue
-
-        time_info = nested(event, "time", "clock")
-        event_minute = first_value(
-            event,
-            "matchMinute",
-            "minute",
-            default=first_value(
-                time_info,
-                "elapsed",
-                "minute",
-            ),
-        )
-
-        extra = first_value(
-            time_info,
-            "extra",
-            default=first_value(event, "extraTime"),
-        )
-
-        player = first_value(
-            event,
-            "player",
-            "playerName",
-            "player_name",
-            default="",
-        )
-
-        if isinstance(player, dict):
-            player = first_value(
-                player,
-                "name",
-                "displayName",
-                default="",
-            )
-
-        team = first_value(
-            event,
-            "team",
-            "teamName",
-            default="",
-        )
-
-        if isinstance(team, dict):
-            team = team_name(team, "")
-
-        rows.append({
-            "Minute": f"{event_minute or '?'}"
-                      + (f"+{extra}" if extra else "") + "'",
-            "Team": team,
-            "Event": first_value(event, "type", "event", default=""),
-            "Detail": first_value(event, "detail", "description", default=""),
-            "Player": player,
-        })
-
-    return rows
-
-
-# ============================================================
-# EXPERIMENTAL LIVE MODEL
-# ============================================================
-
-def poisson_probs(lam: float, max_goals: int = 12):
-    lam = max(0.0, float(lam))
-    probs = [math.exp(-lam)]
-
-    for k in range(1, max_goals + 1):
-        probs.append(probs[-1] * lam / k)
-
-    tail = max(0.0, 1.0 - sum(probs))
-    return probs, tail
-
-
-def probability_pct(value: float) -> str:
-    return f"{100 * max(0.0, min(1.0, value)):.1f}%"
-
-
-def estimate_remaining_goals(
-    minute: int,
-    team_stats: list,
-    opponent_stats: list,
-    red_cards_for: int,
-    red_cards_against: int,
-):
-    """Experimental heuristic, NOT a trained or calibrated model."""
-    remaining = max(0, 90 - minute)
-
-    if remaining <= 0:
-        return 0.0, "No regular time remaining"
-
-    lam = 1.35 * remaining / 90.0
-    evidence = []
-
-    shots = stat_value(team_stats, "Total Shots", "Shots")
-    opponent_shots = stat_value(opponent_stats, "Total Shots", "Shots")
-
-    shots_on_target = stat_value(
-        team_stats,
-        "Shots on Goal",
-        "Shots on Target",
-        "Shots on target",
-        "Shots on goal",
-    )
-
-    opponent_sot = stat_value(
-        opponent_stats,
-        "Shots on Goal",
-        "Shots on Target",
-        "Shots on target",
-        "Shots on goal",
-    )
-
-    if shots is not None and opponent_shots is not None:
-        shot_diff = max(-8.0, min(8.0, shots - opponent_shots))
-        lam *= math.exp(0.025 * shot_diff)
-        evidence.append("shot volume")
-
-    if shots_on_target is not None:
-        lam *= math.exp(0.07 * min(5.0, shots_on_target))
-        evidence.append("shots on target")
-
-    if opponent_sot is not None:
-        lam *= math.exp(-0.035 * min(5.0, opponent_sot))
-        evidence.append("opponent shots on target")
-
-    if red_cards_for:
-        lam *= max(0.45, 0.78 ** red_cards_for)
-        evidence.append("team red card")
-
-    if red_cards_against:
-        lam *= min(1.8, 1.25 ** red_cards_against)
-        evidence.append("opponent red card")
-
-    lam = max(0.0, min(2.5, lam))
-    return lam, ", ".join(evidence) or "generic prior only"
-
-
-def build_score_matrix(home_lam: float, away_lam: float, max_goals: int = 10):
-    home_probs, _ = poisson_probs(home_lam, max_goals)
-    away_probs, _ = poisson_probs(away_lam, max_goals)
-
-    matrix = [
-        (hp * ap, h, a)
-        for h, hp in enumerate(home_probs)
-        for a, ap in enumerate(away_probs)
-    ]
-
-    total = sum(prob for prob, _, _ in matrix)
-
-    if total > 0:
-        matrix = [
-            (prob / total, h, a)
-            for prob, h, a in matrix
-        ]
-
-    return matrix
-
-
-def summarize_outcomes(matrix, home_score: int, away_score: int):
-    home_win = draw = away_win = 0.0
-
-    for prob, add_home, add_away in matrix:
-        h = home_score + add_home
-        a = away_score + add_away
-
-        if h > a:
-            home_win += prob
-        elif h == a:
-            draw += prob
-        else:
-            away_win += prob
-
-    total = home_win + draw + away_win
-
-    if total <= 0:
-        return 0.0, 0.0, 0.0
-
-    return home_win / total, draw / total, away_win / total
-
-
-def over_probability(matrix, home_score: int, away_score: int, line: float):
-    return sum(
-        prob
-        for prob, add_home, add_away in matrix
-        if home_score + away_score + add_home + add_away > line
-    )
-
-
-def btts_probability(matrix, home_score: int, away_score: int):
-    return sum(
-        prob
-        for prob, add_home, add_away in matrix
-        if home_score + add_home > 0 and away_score + add_away > 0
-    )
-
-
-# ============================================================
-# USER INTERFACE
-# ============================================================
-
-st.title("⚽ Live Football Edge")
-st.caption(
-    "GOAL API live data · Experimental remaining-goals model · "
-    "Not validated for betting"
-)
-
-st.info(
-    "The predictions are experimental estimates, not verified betting edges. "
-    "Do not use them as a substitute for a validated model."
-)
-
-col_info, col_refresh = st.columns([4, 1])
-
-with col_info:
-    st.write(
-        "Choose a live match to inspect its current score, statistics, "
-        "events and experimental remaining-match predictions."
-    )
-
-with col_refresh:
-    if st.button("🔄 Refresh", use_container_width=True):
-        get_live_fixtures.clear()
-        get_fixture_details.clear()
-        get_fixture_statistics.clear()
-        get_fixture_events.clear()
-        st.rerun()
-
-
-# ============================================================
-# LOAD LIVE FIXTURES
-# ============================================================
+# ---- Historical data and evaluation ----
+with st.sidebar:
+    st.header("Historical data")
+    st.write("Upload completed results as CSV. Required columns:")
+    st.code("date,home_team,away_team,home_goals,away_goals")
+    uploaded = st.file_uploader("Historical matches CSV", type=["csv"])
+    if uploaded is not None and st.button("Import history", use_container_width=True):
+        try:
+            hist = prepare_history(pd.read_csv(uploaded))
+            count = save_history(hist)
+            st.success(f"Imported/updated {count} rows in the local SQLite database.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Import failed: {exc}")
+
+history = load_history()
+with st.expander("Historical database status", expanded=history.empty):
+    st.write(f"Stored completed matches: **{len(history)}**")
+    if history.empty:
+        st.info("No historical data yet. Upload a CSV before using pre-match team-strength predictions.")
+    else:
+        st.write(f"Date range: {history.date.min()} — {history.date.max()}")
+        st.dataframe(history.tail(10), use_container_width=True, hide_index=True)
+
+if not history.empty:
+    st.subheader("Walk-forward historical evaluation")
+    if st.button("Run expanding-window evaluation"):
+        with st.spinner("Evaluating chronologically; future matches are excluded from each fit..."):
+            try:
+                report = walk_forward_evaluation(history)
+                if report.empty:
+                    st.warning("Not enough usable history to evaluate. Import more matches.")
+                else:
+                    st.session_state["evaluation_report"] = report
+            except Exception as exc:
+                st.error(f"Evaluation failed: {exc}")
+    if "evaluation_report" in st.session_state:
+        report = st.session_state["evaluation_report"]
+        brier = report["brier_1x2"].mean()
+        st.metric("Mean multiclass Brier score (lower is better)", f"{brier:.4f}")
+        st.caption(f"Out-of-sample predictions evaluated: {len(report)}. This is not a guarantee of future performance.")
+        st.dataframe(report.tail(100), use_container_width=True, hide_index=True)
+
+st.divider()
+col1, col2 = st.columns([4, 1])
+with col1:
+    st.write("Choose a live fixture. The app caches API responses and avoids automatic rapid polling.")
+with col2:
+    refresh = st.button("Refresh fixtures", use_container_width=True)
+
+if refresh:
+    st.cache_data.clear()
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_live():
+    return as_list(api_get("fixtures/live"))
 
 try:
-    with st.spinner("Loading live fixtures..."):
-        raw_fixtures = get_live_fixtures()
+    fixtures = [normalize(x) for x in fetch_live()]
 except Exception as exc:
     st.error(f"Could not load live fixtures: {exc}")
     st.stop()
 
-fixtures = [
-    normalise_fixture(item)
-    for item in raw_fixtures
-    if isinstance(item, dict)
-]
-
-fixtures = [item for item in fixtures if item["id"]]
-
+fixtures = [f for f in fixtures if f["id"]]
 if not fixtures:
-    st.info(
-        "GOAL API returned no live fixtures. This can be normal when "
-        "no covered matches are currently live. If you expect live matches, "
-        "check your API plan and account dashboard."
-    )
+    st.info("No live fixtures returned. This is normal when no covered matches are live.")
     st.stop()
 
+league_options = ["All leagues"] + sorted({f["league"] for f in fixtures})
+selected_league = st.selectbox("League", league_options)
+if selected_league != "All leagues":
+    fixtures = [f for f in fixtures if f["league"] == selected_league]
 
-# ============================================================
-# LEAGUE FILTER AND MATCH SELECTION
-# ============================================================
+def fixture_text(f):
+    hs = "—" if f["home_score"] is None else str(f["home_score"])
+    aws = "—" if f["away_score"] is None else str(f["away_score"])
+    return f"{f['home_name']} {hs}–{aws} {f['away_name']} · {f['minute']}' · {f['league']}"
 
-league_names = sorted({item["league"] for item in fixtures})
+selected = st.selectbox("Live match", fixtures, format_func=fixture_text)
+st.subheader(f"{selected['home_name']} {selected['home_score'] if selected['home_score'] is not None else '—'} – "
+             f"{selected['away_score'] if selected['away_score'] is not None else '—'} "
+             f"{selected['away_name']}")
+st.caption(f"{selected['league']} · {selected['minute']}' · Fixture ID {selected['id']}")
 
-selected_league = st.selectbox(
-    "Filter by league",
-    ["All leagues"] + league_names,
-)
-
-filtered = [
-    item
-    for item in fixtures
-    if selected_league == "All leagues"
-    or item["league"] == selected_league
-]
-
-if not filtered:
-    st.info("No live matches found for that league.")
-    st.stop()
-
-
-def fixture_label(item: dict) -> str:
-    home_score = (
-        str(item["home_score"])
-        if item["home_score"] is not None
-        else "—"
-    )
-    away_score = (
-        str(item["away_score"])
-        if item["away_score"] is not None
-        else "—"
-    )
-
-    return (
-        f"{item['home_name']} {home_score}–"
-        f"{away_score} {item['away_name']} · "
-        f"{item['minute']}' · {item['league']}"
-    )
-
-
-labels = {
-    f"{fixture_label(item)} · ID {item['id']}": item
-    for item in filtered
-}
-
-selected_label = st.selectbox(
-    "Select a live match",
-    list(labels.keys()),
-)
-
-match = labels[selected_label]
-
-fixture_id = match["id"]
-home_name = match["home_name"]
-away_name = match["away_name"]
-home_id = match["home_id"]
-away_id = match["away_id"]
-home_score = match["home_score"]
-away_score = match["away_score"]
-minute = match["minute"]
-
-st.divider()
-
-score_col1, score_col2, score_col3 = st.columns([2, 1, 2])
-
-with score_col1:
-    st.subheader(home_name)
-    st.metric(
-        "Home goals",
-        home_score if home_score is not None else "—",
-    )
-
-with score_col2:
-    st.subheader(f"{minute}'")
-    st.caption(match["league"])
-
-with score_col3:
-    st.subheader(away_name)
-    st.metric(
-        "Away goals",
-        away_score if away_score is not None else "—",
-    )
-
-
-# ============================================================
-# GUARD AGAINST MISSING SCORES
-# ============================================================
-
-if home_score is None or away_score is None:
-    st.warning(
-        "The API returned this fixture, but the app could not identify "
-        "both current scores. The score is shown as — instead of assuming "
-        "0–0. Predictions are paused to avoid calculations using incorrect "
-        "score data. Try Refresh; if the issue continues, the API response "
-        "format for this fixture needs to be inspected."
-    )
-
-    with st.expander("Score parsing diagnostics"):
-        raw = match.get("raw", {})
-        st.write("Available top-level response fields:")
-        st.code(", ".join(str(key) for key in raw.keys()))
-
-        for key in (
-            "homeTeamScore",
-            "awayTeamScore",
-            "goals",
-            "score",
-            "scores",
-            "currentScore",
-        ):
-            if key in raw:
-                st.write(f"**{key}:**")
-                st.json(raw[key])
-
-    st.stop()
-
-
-# ============================================================
-# LOAD MATCH DATA
-# ============================================================
-
-if "selected_fixture_id" not in st.session_state:
-    st.session_state.selected_fixture_id = None
-
-if st.button(
-    "📊 Load statistics, events & predictions",
-    type="primary",
-):
-    st.session_state.selected_fixture_id = fixture_id
-
-if st.session_state.selected_fixture_id != fixture_id:
-    st.info("Press the button above to analyze this match.")
+if selected["home_score"] is None or selected["away_score"] is None:
+    st.error("One or both scores are missing/unrecognized. Predictions are paused; the app will not silently assume 0–0.")
+    with st.expander("Score parser diagnostics"):
+        st.write(list(selected["raw"].keys()))
+        st.json(selected["raw"])
     st.stop()
 
 try:
-    with st.spinner("Loading match data..."):
-        stats_payload = get_fixture_statistics(fixture_id)
-        events = get_fixture_events(fixture_id)
+    stats = as_list(api_get(f"fixtures/{selected['id']}/statistics"))
+    events = as_list(api_get(f"fixtures/{selected['id']}/events"))
 except Exception as exc:
-    st.error(f"Could not load statistics or events: {exc}")
-    st.stop()
+    st.warning(f"Live stats/events unavailable: {exc}. The app will not invent missing statistics.")
+    stats, events = [], []
 
-home_stats, away_stats = normalise_stat_rows(stats_payload)
+# Flexible stat row handling: common flat shape and team-grouped shape.
+home_stats, away_stats = [], []
+for row in stats:
+    team = row.get("team") if isinstance(row.get("team"), dict) else {}
+    label_team = str(first(team, "name", default=first(row, "teamName", "team", default=""))).lower()
+    nested_stats = first(row, "statistics", "stats", "items", default=None)
+    if isinstance(nested_stats, list):
+        target = home_stats if "home" in label_team else away_stats if "away" in label_team else None
+        if target is not None:
+            target.extend(nested_stats)
+    else:
+        name = first(row, "type", "name", "label", "statistic")
+        hv, av = first(row, "home", "homeValue", "home_value"), first(row, "away", "awayValue", "away_value")
+        if name is not None:
+            if hv is not None: home_stats.append({"type": name, "value": hv})
+            if av is not None: away_stats.append({"type": name, "value": av})
 
-
-# ============================================================
-# LIVE STATISTICS
-# ============================================================
-
-st.subheader("Live match statistics")
-
-stats_to_show = [
+stats_rows = []
+for label, aliases in [
     ("Shots on target", ("Shots on Goal", "Shots on Target", "Shots on target")),
     ("Total shots", ("Total Shots", "Shots")),
-    ("Shots off target", ("Shots off Goal", "Shots off target")),
-    ("Blocked shots", ("Blocked Shots",)),
     ("Possession", ("Ball Possession", "Possession")),
     ("Corners", ("Corner Kicks", "Corners")),
-    ("Yellow cards", ("Yellow Cards",)),
-    ("Red cards", ("Red Cards",)),
-    ("Expected goals (xG)", ("expected_goals", "xG", "Expected Goals")),
-]
-
-rows = []
-
-for label, names in stats_to_show:
-    hv = stat_value(home_stats, *names)
-    av = stat_value(away_stats, *names)
-
+    ("xG", ("expected_goals", "Expected Goals", "xG")),
+]:
+    hv, av = stat_value(home_stats, *aliases), stat_value(away_stats, *aliases)
     if hv is not None or av is not None:
-        if label == "Possession":
-            h_text = f"{hv:g}%" if hv is not None else "N/A"
-            a_text = f"{av:g}%" if av is not None else "N/A"
-        else:
-            h_text = f"{hv:g}" if hv is not None else "N/A"
-            a_text = f"{av:g}" if av is not None else "N/A"
-
-        rows.append({
-            "Statistic": label,
-            home_name: h_text,
-            away_name: a_text,
-        })
-
-if rows:
-    st.dataframe(
-        rows,
-        hide_index=True,
-        use_container_width=True,
-    )
+        stats_rows.append({"Statistic": label, selected["home_name"]: hv, selected["away_name"]: av})
+if stats_rows:
+    st.subheader("Available live statistics")
+    st.dataframe(stats_rows, hide_index=True, use_container_width=True)
 else:
-    st.warning(
-        "The API response did not match the statistics formats currently "
-        "recognized by this app. Predictions will use a generic prior until "
-        "we adjust the parser to the actual response."
-    )
+    st.info("No recognized statistics were returned. Missing stats are left unknown.")
 
+# Save the current observation, not the full raw payload.
+try:
+    save_snapshot(selected, json.dumps(selected["raw"], ensure_ascii=False, default=str))
+except Exception:
+    pass
 
-# ============================================================
-# PREDICTIONS
-# ============================================================
+if history.empty:
+    st.warning("NO BET / INSUFFICIENT DATA: import historical results before team-strength predictions can be generated.")
+    st.stop()
 
-home_reds = count_red_cards(events, home_id, home_name)
-away_reds = count_red_cards(events, away_id, away_name)
+status = model_status(history, selected["home_name"], selected["away_name"])
+if not status.ready:
+    st.warning(f"NO BET / INSUFFICIENT DATA: {status.reason}")
+    st.stop()
 
-st.subheader("Experimental remaining-goals estimates")
-
-home_lam, home_basis = estimate_remaining_goals(
-    minute,
-    home_stats,
-    away_stats,
-    home_reds,
-    away_reds,
+home_pre, away_pre = pre_match_lambdas(history, selected["home_name"], selected["away_name"])
+home_sot = stat_value(home_stats, "Shots on Goal", "Shots on Target", "Shots on target")
+away_sot = stat_value(away_stats, "Shots on Goal", "Shots on Target", "Shots on target")
+# Red-card adjustment is disabled until GOAL API event team attribution is verified.
+# Counting card text alone could incorrectly assign an away-team card to the home side.
+home_reds = 0
+away_reds = 0
+home_remaining, away_remaining = in_play_lambdas(
+    home_pre, away_pre, selected["minute"], selected["home_score"], selected["away_score"],
+    home_sot, away_sot, home_reds, away_reds
 )
+matrix = score_matrix(home_remaining, away_remaining)
+probs = markets(matrix, selected["home_score"], selected["away_score"])
 
-away_lam, away_basis = estimate_remaining_goals(
-    minute,
-    away_stats,
-    home_stats,
-    away_reds,
-    home_reds,
-)
-
-home_p, _ = poisson_probs(home_lam)
-away_p, _ = poisson_probs(away_lam)
-
-matrix = build_score_matrix(home_lam, away_lam)
-
-p_home, p_draw, p_away = summarize_outcomes(
-    matrix,
-    home_score,
-    away_score,
-)
-
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric(
-    f"{home_name}: expected remaining goals",
-    f"{home_lam:.2f}",
-)
-c2.metric(
-    f"{home_name}: chance to score again",
-    probability_pct(1 - home_p[0]),
-)
-c3.metric(
-    f"{away_name}: expected remaining goals",
-    f"{away_lam:.2f}",
-)
-c4.metric(
-    f"{away_name}: chance to score again",
-    probability_pct(1 - away_p[0]),
-)
-
-with st.expander("What influenced these estimates?"):
-    st.write(f"**{home_name}:** {home_basis}")
-    st.write(f"**{away_name}:** {away_basis}")
-    st.write(
-        "The model uses a generic scoring-rate prior, adjusted by available "
-        "shots and red-card counts. It has not been trained or calibrated "
-        "on historical in-play data."
-    )
-
-
-# ============================================================
-# PROJECTED FINAL RESULT
-# ============================================================
-
-st.subheader("Projected final result")
-
-st.caption(
-    "These are approximate model probabilities. They assume independent "
-    "Poisson-distributed remaining goals and regular time up to 90 minutes."
-)
-
+st.subheader("Live model estimates")
+st.caption("Poisson baseline fitted to imported completed results, then adjusted for time and available shots. In-play layer is not calibrated.")
 c1, c2, c3 = st.columns(3)
+c1.metric(f"{selected['home_name']} win", f"{probs['1']:.1%}")
+c2.metric("Draw", f"{probs['X']:.1%}")
+c3.metric(f"{selected['away_name']} win", f"{probs['2']:.1%}")
 
-c1.metric(f"{home_name} win", probability_pct(p_home))
-c2.metric("Draw", probability_pct(p_draw))
-c3.metric(f"{away_name} win", probability_pct(p_away))
-
-
-# ============================================================
-# MOST LIKELY FINAL SCORES
-# ============================================================
+with st.expander("Double chance and goal markets"):
+    market_rows = [{"Market": name, "Probability": f"{value:.1%}"} for name, value in probs.items()]
+    st.dataframe(market_rows, hide_index=True, use_container_width=True)
 
 st.subheader("Most likely final scores")
-
-ranked_scores = sorted(matrix, reverse=True)[:5]
-
 score_rows = [
-    {
-        "Projected final score": (
-            f"{home_name} {home_score + add_home}–"
-            f"{away_score + add_away} {away_name}"
-        ),
-        "Probability within displayed score range": probability_pct(prob),
-    }
-    for prob, add_home, add_away in ranked_scores
+    {"Projected final score": f"{selected['home_name']} {h}–{a} {selected['away_name']}",
+     "Probability": f"{p:.1%}"}
+    for p, h, a in top_final_scores(matrix, selected["home_score"], selected["away_score"])
 ]
+st.dataframe(score_rows, hide_index=True, use_container_width=True)
 
-st.dataframe(
-    score_rows,
-    hide_index=True,
-    use_container_width=True,
-)
-
-
-# ============================================================
-# OVER / UNDER MARKETS
-# ============================================================
-
-st.subheader("Total goals markets")
-
-market_rows = []
-
-for line in (0.5, 1.5, 2.5, 3.5, 4.5):
-    over_p = over_probability(
-        matrix,
-        home_score,
-        away_score,
-        line,
-    )
-
-    market_rows.append({
-        "Market": f"Over {line}",
-        "Probability": probability_pct(over_p),
-    })
-
-    market_rows.append({
-        "Market": f"Under {line}",
-        "Probability": probability_pct(1 - over_p),
-    })
-
-st.dataframe(
-    market_rows,
-    hide_index=True,
-    use_container_width=True,
-)
-
-
-# ============================================================
-# BOTH TEAMS TO SCORE
-# ============================================================
-
-st.subheader("Both teams to score")
-
-btts_p = btts_probability(
-    matrix,
-    home_score,
-    away_score,
-)
-
-btts_c1, btts_c2 = st.columns(2)
-
-btts_c1.metric("BTTS — Yes", probability_pct(btts_p))
-btts_c2.metric("BTTS — No", probability_pct(1 - btts_p))
-
-
-# ============================================================
-# RECENT MATCH EVENTS
-# ============================================================
-
-st.subheader("Recent match events")
-
-rows = event_rows(events)
-
-if rows:
-    st.dataframe(
-        list(reversed(rows[-15:])),
-        hide_index=True,
-        use_container_width=True,
-    )
+st.subheader("Recent saved live snapshots")
+snapshots = recent_snapshots(20)
+if not snapshots.empty:
+    st.dataframe(snapshots, use_container_width=True, hide_index=True)
 else:
-    st.info("No match events were returned for this fixture.")
-
-
-# ============================================================
-# FOOTER
-# ============================================================
+    st.caption("Snapshots will appear after a match is analyzed.")
 
 st.divider()
-
-st.warning(
-    "EXPERIMENTAL MODEL — These outputs are not validated betting edges. "
-    "Statistics may be missing or differently formatted, and the scoring "
-    "heuristic has not been calibrated against historical in-play results. "
-    "Treat all probabilities as provisional."
-)
-
-st.caption(
-    f"Data provider: GOAL API · Fixture ID: {fixture_id} · "
-    f"Calculated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-)
-st.caption(
-    f"Data provider: GOAL API · Fixture ID: {fixture_id} · "
-    f"Calculated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+st.warning("NO ODDS SOURCE IS CONNECTED. No EV/edge is calculated. Do not treat probabilities as validated until walk-forward results and calibration are reviewed.")
 )

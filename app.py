@@ -565,4 +565,4 @@ st.warning(
 st.caption(
     f"Fixture ID: {fixture_id} · "
     f"Last page calculation: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-)
+) 

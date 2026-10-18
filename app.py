@@ -112,7 +112,6 @@ def list_from_payload(payload: Any) -> list:
             if isinstance(value, list):
                 return value
 
-        # Some endpoints return one object rather than a list.
         if any(
             key in payload
             for key in ("id", "fixtureId", "fixture_id", "match_id")
@@ -171,12 +170,15 @@ def as_number(value):
         return None
 
     if isinstance(value, (int, float)):
-        return float(value)
+        if math.isfinite(float(value)):
+            return float(value)
+        return None
 
     if isinstance(value, str):
         cleaned = value.replace("%", "").strip()
         try:
-            return float(cleaned)
+            number = float(cleaned)
+            return number if math.isfinite(number) else None
         except ValueError:
             return None
 
@@ -186,6 +188,109 @@ def as_number(value):
 def safe_int(value, default=0) -> int:
     number = as_number(value)
     return int(number) if number is not None else default
+
+
+def parse_score(value):
+    """
+    Return an integer score, or None if the score is genuinely unavailable.
+    Never convert a missing or unrecognized score to zero.
+    """
+    if isinstance(value, dict):
+        value = first_value(
+            value,
+            "score",
+            "goals",
+            "value",
+            "total",
+            "current",
+        )
+
+    number = as_number(value)
+
+    if number is None or number < 0:
+        return None
+
+    return int(number)
+
+
+def extract_score(item: dict, side: str):
+    """
+    Recognize multiple common score formats, including GOAL API's
+    homeTeamScore and awayTeamScore fields.
+    """
+    if side == "home":
+        direct_keys = (
+            "homeTeamScore",
+            "home_score",
+            "homeScore",
+            "homeGoals",
+            "home_goals",
+            "match_hometeam_score",
+            "scoreHome",
+        )
+        nested_keys = (
+            "home",
+            "homeScore",
+            "home_score",
+            "homeTeam",
+            "homeTeamScore",
+        )
+    else:
+        direct_keys = (
+            "awayTeamScore",
+            "away_score",
+            "awayScore",
+            "awayGoals",
+            "away_goals",
+            "match_awayteam_score",
+            "scoreAway",
+        )
+        nested_keys = (
+            "away",
+            "awayScore",
+            "away_score",
+            "awayTeam",
+            "awayTeamScore",
+        )
+
+    # First: explicit score fields on the fixture.
+    direct = first_value(item, *direct_keys)
+    score = parse_score(direct)
+
+    if score is not None:
+        return score
+
+    # Second: common nested score containers.
+    for container_key in ("goals", "score", "scores", "currentScore"):
+        container = item.get(container_key)
+
+        if not isinstance(container, dict):
+            continue
+
+        candidate = first_value(container, *nested_keys)
+        score = parse_score(candidate)
+
+        if score is not None:
+            return score
+
+        # Some APIs use nested structures such as {"home": {"score": 2}}.
+        if side in container:
+            score = parse_score(container[side])
+            if score is not None:
+                return score
+
+    # Third: nested fixture structures.
+    fixture = nested(item, "fixture")
+    for container_key in ("goals", "score", "scores"):
+        container = fixture.get(container_key)
+
+        if isinstance(container, dict):
+            candidate = first_value(container, *nested_keys)
+            score = parse_score(candidate)
+            if score is not None:
+                return score
+
+    return None
 
 
 def team_name(team: Any, fallback: str) -> str:
@@ -215,31 +320,47 @@ def team_id(team: Any):
 
 def normalise_fixture(item: dict) -> dict:
     """
-    Convert common GOAL API / football API response shapes into
-    one internal structure. Original data is retained.
+    Normalize fixture fields. A missing score remains None instead of
+    being incorrectly displayed as 0.
     """
     fixture = nested(item, "fixture")
     teams = nested(item, "teams")
     league = nested(item, "league")
-    goals = nested(item, "goals", "score", "scores")
     status = nested(item, "status", "fixtureStatus")
 
     home = first_value(
-        teams, "home", "homeTeam", "home_team",
+        teams,
+        "home",
+        "homeTeam",
+        "home_team",
         default=first_value(
-            item, "homeTeam", "home_team", "home",
+            item,
+            "homeTeam",
+            "home_team",
+            "home",
             default=first_value(
-                item, "match_hometeam_name", "homeTeamName",
+                item,
+                "match_hometeam_name",
+                "homeTeamName",
                 default="Home",
             ),
         ),
     )
+
     away = first_value(
-        teams, "away", "awayTeam", "away_team",
+        teams,
+        "away",
+        "awayTeam",
+        "away_team",
         default=first_value(
-            item, "awayTeam", "away_team", "away",
+            item,
+            "awayTeam",
+            "away_team",
+            "away",
             default=first_value(
-                item, "match_awayteam_name", "awayTeamName",
+                item,
+                "match_awayteam_name",
+                "awayTeamName",
                 default="Away",
             ),
         ),
@@ -248,25 +369,22 @@ def normalise_fixture(item: dict) -> dict:
     home_name = team_name(home, "Home")
     away_name = team_name(away, "Away")
 
-    home_score = first_value(
-        goals, "home", "homeScore", "home_score",
-        default=first_value(
-            item, "match_hometeam_score", "homeScore", "home_score"
-        ),
-    )
-    away_score = first_value(
-        goals, "away", "awayScore", "away_score",
-        default=first_value(
-            item, "match_awayteam_score", "awayScore", "away_score"
-        ),
-    )
+    # FIX: recognize homeTeamScore / awayTeamScore and other formats.
+    home_score = extract_score(item, "home")
+    away_score = extract_score(item, "away")
 
     minute = first_value(
-        item, "matchMinute", "matchElapsed", "match_minute",
+        item,
+        "matchMinute",
         "matchElapsed",
+        "match_minute",
+        "elapsed",
+        "minute",
         default=first_value(
-            status, "elapsed", "minute",
-            default=first_value(item, "match_status", "minute"),
+            status,
+            "elapsed",
+            "minute",
+            default=first_value(item, "match_status"),
         ),
     )
 
@@ -280,13 +398,30 @@ def normalise_fixture(item: dict) -> dict:
         minute = safe_int(digits, 0)
 
     fixture_id = first_value(
-        item, "id", "fixtureId", "fixture_id", "match_id",
-        default=first_value(fixture, "id", "fixtureId", "fixture_id"),
+        item,
+        "id",
+        "fixtureId",
+        "fixture_id",
+        "match_id",
+        default=first_value(
+            fixture,
+            "id",
+            "fixtureId",
+            "fixture_id",
+        ),
     )
 
     league_name = first_value(
-        league, "name", "leagueName", "league_name",
-        default=first_value(item, "leagueName", "league_name", default="Unknown league"),
+        league,
+        "name",
+        "leagueName",
+        "league_name",
+        default=first_value(
+            item,
+            "leagueName",
+            "league_name",
+            default="Unknown league",
+        ),
     )
 
     return {
@@ -295,8 +430,8 @@ def normalise_fixture(item: dict) -> dict:
         "away_name": away_name,
         "home_id": team_id(home),
         "away_id": team_id(away),
-        "home_score": safe_int(home_score),
-        "away_score": safe_int(away_score),
+        "home_score": home_score,
+        "away_score": away_score,
         "minute": max(0, min(130, safe_int(minute))),
         "league": str(league_name),
         "status": status,
@@ -305,10 +440,6 @@ def normalise_fixture(item: dict) -> dict:
 
 
 def normalise_stat_rows(payload: list) -> tuple[list, list]:
-    """
-    Supports statistics returned as two team objects, one object
-    containing home/away statistics, or simple key/value records.
-    """
     home_stats = []
     away_stats = []
 
@@ -316,14 +447,16 @@ def normalise_stat_rows(payload: list) -> tuple[list, list]:
         if not isinstance(row, dict):
             continue
 
-        # API shape with a team object and statistics list.
         team = nested(row, "team")
         stats = first_value(
-            row, "statistics", "stats", "items", default=[]
+            row,
+            "statistics",
+            "stats",
+            "items",
+            default=[],
         )
 
         if isinstance(stats, list):
-            tid = team_id(team)
             name = team_name(team, "")
             target = None
 
@@ -334,26 +467,41 @@ def normalise_stat_rows(payload: list) -> tuple[list, list]:
 
             if target is not None:
                 target.extend(stats)
-            elif tid is not None:
-                # IDs are associated with teams later where possible.
-                row["_parsed_team_id"] = tid
-                row["_parsed_stats"] = stats
+
             continue
 
-        # Generic statistic object: {type/name, home, away}.
         stat_name = first_value(
-            row, "type", "name", "statistic", "label"
+            row,
+            "type",
+            "name",
+            "statistic",
+            "label",
         )
-        home_value = first_value(row, "home", "homeValue", "home_value")
-        away_value = first_value(row, "away", "awayValue", "away_value")
+        home_value = first_value(
+            row,
+            "home",
+            "homeValue",
+            "home_value",
+        )
+        away_value = first_value(
+            row,
+            "away",
+            "awayValue",
+            "away_value",
+        )
 
         if stat_name is not None:
             if home_value is not None:
-                home_stats.append({"type": stat_name, "value": home_value})
+                home_stats.append({
+                    "type": stat_name,
+                    "value": home_value,
+                })
             if away_value is not None:
-                away_stats.append({"type": stat_name, "value": away_value})
+                away_stats.append({
+                    "type": stat_name,
+                    "value": away_value,
+                })
 
-    # Handle providers returning a dict-shaped data object separately.
     return home_stats, away_stats
 
 
@@ -365,7 +513,14 @@ def stat_value(stat_list, *names):
             continue
 
         label = str(
-            first_value(item, "type", "name", "label", "statistic", default="")
+            first_value(
+                item,
+                "type",
+                "name",
+                "label",
+                "statistic",
+                default="",
+            )
         ).lower()
 
         if label in wanted:
@@ -395,8 +550,15 @@ def count_red_cards(events: list, team_identifier=None, team_label=None) -> int:
                 continue
 
         detail = str(
-            first_value(event, "detail", "description", "card", default="")
+            first_value(
+                event,
+                "detail",
+                "description",
+                "card",
+                default="",
+            )
         ).lower()
+
         event_type = str(
             first_value(event, "type", "event", default="")
         ).lower()
@@ -416,21 +578,45 @@ def event_rows(events: list) -> list:
 
         time_info = nested(event, "time", "clock")
         event_minute = first_value(
-            event, "matchMinute", "minute",
-            default=first_value(time_info, "elapsed", "minute"),
+            event,
+            "matchMinute",
+            "minute",
+            default=first_value(
+                time_info,
+                "elapsed",
+                "minute",
+            ),
         )
+
         extra = first_value(
-            time_info, "extra",
+            time_info,
+            "extra",
             default=first_value(event, "extraTime"),
         )
 
         player = first_value(
-            event, "player", "playerName", "player_name", default=""
+            event,
+            "player",
+            "playerName",
+            "player_name",
+            default="",
         )
-        if isinstance(player, dict):
-            player = first_value(player, "name", "displayName", default="")
 
-        team = first_value(event, "team", "teamName", default="")
+        if isinstance(player, dict):
+            player = first_value(
+                player,
+                "name",
+                "displayName",
+                default="",
+            )
+
+        team = first_value(
+            event,
+            "team",
+            "teamName",
+            default="",
+        )
+
         if isinstance(team, dict):
             team = team_name(team, "")
 
@@ -472,15 +658,12 @@ def estimate_remaining_goals(
     red_cards_for: int,
     red_cards_against: int,
 ):
-    """
-    Simple experimental heuristic, NOT a trained or calibrated model.
-    """
+    """Experimental heuristic, NOT a trained or calibrated model."""
     remaining = max(0, 90 - minute)
 
     if remaining <= 0:
         return 0.0, "No regular time remaining"
 
-    # Generic prior; replace only after historical validation.
     lam = 1.35 * remaining / 90.0
     evidence = []
 
@@ -488,12 +671,19 @@ def estimate_remaining_goals(
     opponent_shots = stat_value(opponent_stats, "Total Shots", "Shots")
 
     shots_on_target = stat_value(
-        team_stats, "Shots on Goal", "Shots on Target",
-        "Shots on target", "Shots on goal",
+        team_stats,
+        "Shots on Goal",
+        "Shots on Target",
+        "Shots on target",
+        "Shots on goal",
     )
+
     opponent_sot = stat_value(
-        opponent_stats, "Shots on Goal", "Shots on Target",
-        "Shots on target", "Shots on goal",
+        opponent_stats,
+        "Shots on Goal",
+        "Shots on Target",
+        "Shots on target",
+        "Shots on goal",
     )
 
     if shots is not None and opponent_shots is not None:
@@ -532,8 +722,12 @@ def build_score_matrix(home_lam: float, away_lam: float, max_goals: int = 10):
     ]
 
     total = sum(prob for prob, _, _ in matrix)
+
     if total > 0:
-        matrix = [(prob / total, h, a) for prob, h, a in matrix]
+        matrix = [
+            (prob / total, h, a)
+            for prob, h, a in matrix
+        ]
 
     return matrix
 
@@ -553,6 +747,7 @@ def summarize_outcomes(matrix, home_score: int, away_score: int):
             away_win += prob
 
     total = home_win + draw + away_win
+
     if total <= 0:
         return 0.0, 0.0, 0.0
 
@@ -561,14 +756,16 @@ def summarize_outcomes(matrix, home_score: int, away_score: int):
 
 def over_probability(matrix, home_score: int, away_score: int, line: float):
     return sum(
-        prob for prob, add_home, add_away in matrix
+        prob
+        for prob, add_home, add_away in matrix
         if home_score + away_score + add_home + add_away > line
     )
 
 
 def btts_probability(matrix, home_score: int, away_score: int):
     return sum(
-        prob for prob, add_home, add_away in matrix
+        prob
+        for prob, add_home, add_away in matrix
         if home_score + add_home > 0 and away_score + add_away > 0
     )
 
@@ -605,7 +802,10 @@ with col_refresh:
         st.rerun()
 
 
-# Fetch live fixtures
+# ============================================================
+# LOAD LIVE FIXTURES
+# ============================================================
+
 try:
     with st.spinner("Loading live fixtures..."):
         raw_fixtures = get_live_fixtures()
@@ -630,15 +830,20 @@ if not fixtures:
     st.stop()
 
 
-# League filter
+# ============================================================
+# LEAGUE FILTER AND MATCH SELECTION
+# ============================================================
+
 league_names = sorted({item["league"] for item in fixtures})
+
 selected_league = st.selectbox(
     "Filter by league",
     ["All leagues"] + league_names,
 )
 
 filtered = [
-    item for item in fixtures
+    item
+    for item in fixtures
     if selected_league == "All leagues"
     or item["league"] == selected_league
 ]
@@ -649,9 +854,20 @@ if not filtered:
 
 
 def fixture_label(item: dict) -> str:
+    home_score = (
+        str(item["home_score"])
+        if item["home_score"] is not None
+        else "—"
+    )
+    away_score = (
+        str(item["away_score"])
+        if item["away_score"] is not None
+        else "—"
+    )
+
     return (
-        f"{item['home_name']} {item['home_score']}–"
-        f"{item['away_score']} {item['away_name']} · "
+        f"{item['home_name']} {home_score}–"
+        f"{away_score} {item['away_name']} · "
         f"{item['minute']}' · {item['league']}"
     )
 
@@ -661,7 +877,11 @@ labels = {
     for item in filtered
 }
 
-selected_label = st.selectbox("Select a live match", list(labels.keys()))
+selected_label = st.selectbox(
+    "Select a live match",
+    list(labels.keys()),
+)
+
 match = labels[selected_label]
 
 fixture_id = match["id"]
@@ -679,7 +899,10 @@ score_col1, score_col2, score_col3 = st.columns([2, 1, 2])
 
 with score_col1:
     st.subheader(home_name)
-    st.metric("Home goals", home_score)
+    st.metric(
+        "Home goals",
+        home_score if home_score is not None else "—",
+    )
 
 with score_col2:
     st.subheader(f"{minute}'")
@@ -687,20 +910,61 @@ with score_col2:
 
 with score_col3:
     st.subheader(away_name)
-    st.metric("Away goals", away_score)
+    st.metric(
+        "Away goals",
+        away_score if away_score is not None else "—",
+    )
 
 
-# Only load the extra endpoints when the user requests them.
+# ============================================================
+# GUARD AGAINST MISSING SCORES
+# ============================================================
+
+if home_score is None or away_score is None:
+    st.warning(
+        "The API returned this fixture, but the app could not identify "
+        "both current scores. The score is shown as — instead of assuming "
+        "0–0. Predictions are paused to avoid calculations using incorrect "
+        "score data. Try Refresh; if the issue continues, the API response "
+        "format for this fixture needs to be inspected."
+    )
+
+    with st.expander("Score parsing diagnostics"):
+        raw = match.get("raw", {})
+        st.write("Available top-level response fields:")
+        st.code(", ".join(str(key) for key in raw.keys()))
+
+        for key in (
+            "homeTeamScore",
+            "awayTeamScore",
+            "goals",
+            "score",
+            "scores",
+            "currentScore",
+        ):
+            if key in raw:
+                st.write(f"**{key}:**")
+                st.json(raw[key])
+
+    st.stop()
+
+
+# ============================================================
+# LOAD MATCH DATA
+# ============================================================
+
 if "selected_fixture_id" not in st.session_state:
     st.session_state.selected_fixture_id = None
 
-if st.button("📊 Load statistics, events & predictions", type="primary"):
+if st.button(
+    "📊 Load statistics, events & predictions",
+    type="primary",
+):
     st.session_state.selected_fixture_id = fixture_id
 
 if st.session_state.selected_fixture_id != fixture_id:
     st.info("Press the button above to analyze this match.")
     st.stop()
-
 
 try:
     with st.spinner("Loading match data..."):
@@ -710,14 +974,7 @@ except Exception as exc:
     st.error(f"Could not load statistics or events: {exc}")
     st.stop()
 
-
 home_stats, away_stats = normalise_stat_rows(stats_payload)
-
-# Some responses provide statistics under a nested data object.
-if not home_stats and not away_stats and isinstance(stats_payload, dict):
-    home_stats, away_stats = normalise_stat_rows(
-        list_from_payload(stats_payload)
-    )
 
 
 # ============================================================
@@ -759,7 +1016,11 @@ for label, names in stats_to_show:
         })
 
 if rows:
-    st.dataframe(rows, hide_index=True, use_container_width=True)
+    st.dataframe(
+        rows,
+        hide_index=True,
+        use_container_width=True,
+    )
 else:
     st.warning(
         "The API response did not match the statistics formats currently "
@@ -778,11 +1039,19 @@ away_reds = count_red_cards(events, away_id, away_name)
 st.subheader("Experimental remaining-goals estimates")
 
 home_lam, home_basis = estimate_remaining_goals(
-    minute, home_stats, away_stats, home_reds, away_reds
+    minute,
+    home_stats,
+    away_stats,
+    home_reds,
+    away_reds,
 )
 
 away_lam, away_basis = estimate_remaining_goals(
-    minute, away_stats, home_stats, away_reds, home_reds
+    minute,
+    away_stats,
+    home_stats,
+    away_reds,
+    home_reds,
 )
 
 home_p, _ = poisson_probs(home_lam)
@@ -791,7 +1060,9 @@ away_p, _ = poisson_probs(away_lam)
 matrix = build_score_matrix(home_lam, away_lam)
 
 p_home, p_draw, p_away = summarize_outcomes(
-    matrix, home_score, away_score
+    matrix,
+    home_score,
+    away_score,
 )
 
 c1, c2, c3, c4 = st.columns(4)
@@ -818,12 +1089,15 @@ with st.expander("What influenced these estimates?"):
     st.write(f"**{away_name}:** {away_basis}")
     st.write(
         "The model uses a generic scoring-rate prior, adjusted by available "
-        "shots and red-card counts. It has not been trained or calibrated on "
-        "historical in-play data."
+        "shots and red-card counts. It has not been trained or calibrated "
+        "on historical in-play data."
     )
 
 
-# 1X2
+# ============================================================
+# PROJECTED FINAL RESULT
+# ============================================================
+
 st.subheader("Projected final result")
 
 st.caption(
@@ -838,7 +1112,10 @@ c2.metric("Draw", probability_pct(p_draw))
 c3.metric(f"{away_name} win", probability_pct(p_away))
 
 
-# Most likely final scores
+# ============================================================
+# MOST LIKELY FINAL SCORES
+# ============================================================
+
 st.subheader("Most likely final scores")
 
 ranked_scores = sorted(matrix, reverse=True)[:5]
@@ -854,40 +1131,68 @@ score_rows = [
     for prob, add_home, add_away in ranked_scores
 ]
 
-st.dataframe(score_rows, hide_index=True, use_container_width=True)
+st.dataframe(
+    score_rows,
+    hide_index=True,
+    use_container_width=True,
+)
 
 
-# Over/Under markets
+# ============================================================
+# OVER / UNDER MARKETS
+# ============================================================
+
 st.subheader("Total goals markets")
 
 market_rows = []
 
 for line in (0.5, 1.5, 2.5, 3.5, 4.5):
-    over_p = over_probability(matrix, home_score, away_score, line)
+    over_p = over_probability(
+        matrix,
+        home_score,
+        away_score,
+        line,
+    )
 
     market_rows.append({
         "Market": f"Over {line}",
         "Probability": probability_pct(over_p),
     })
+
     market_rows.append({
         "Market": f"Under {line}",
         "Probability": probability_pct(1 - over_p),
     })
 
-st.dataframe(market_rows, hide_index=True, use_container_width=True)
+st.dataframe(
+    market_rows,
+    hide_index=True,
+    use_container_width=True,
+)
 
 
-# BTTS
+# ============================================================
+# BOTH TEAMS TO SCORE
+# ============================================================
+
 st.subheader("Both teams to score")
 
-btts_p = btts_probability(matrix, home_score, away_score)
+btts_p = btts_probability(
+    matrix,
+    home_score,
+    away_score,
+)
 
 btts_c1, btts_c2 = st.columns(2)
+
 btts_c1.metric("BTTS — Yes", probability_pct(btts_p))
 btts_c2.metric("BTTS — No", probability_pct(1 - btts_p))
 
 
-# Recent events
+# ============================================================
+# RECENT MATCH EVENTS
+# ============================================================
+
 st.subheader("Recent match events")
 
 rows = event_rows(events)
@@ -902,7 +1207,10 @@ else:
     st.info("No match events were returned for this fixture.")
 
 
-# Footer
+# ============================================================
+# FOOTER
+# ============================================================
+
 st.divider()
 
 st.warning(
@@ -912,6 +1220,10 @@ st.warning(
     "Treat all probabilities as provisional."
 )
 
+st.caption(
+    f"Data provider: GOAL API · Fixture ID: {fixture_id} · "
+    f"Calculated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+)
 st.caption(
     f"Data provider: GOAL API · Fixture ID: {fixture_id} · "
     f"Calculated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"

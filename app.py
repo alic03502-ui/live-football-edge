@@ -248,8 +248,3 @@ st.caption(
     "This version displays provider data; it does not yet generate "
     "predictions or claim betting value."
 )
-                st.caption(f"Provider event ID: {match.get('id', 'unavailable')}")
-    except requests.RequestException as exc:
-        st.error(f"Could not reach the live data provider: {exc}")
-    except (ValueError, RuntimeError) as exc:
-        st.error(f"Live data could not be validated: {exc}")

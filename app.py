@@ -25,8 +25,8 @@ from storage import (
     save_history,
     save_snapshot,
     recent_snapshots,
+    save_final_result,
 )
-
 BASE_URL = "https://api.goal-api.com/v1"
 TIMEOUT = 20
 

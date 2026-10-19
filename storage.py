@@ -109,3 +109,4 @@ def recent_snapshots(limit: int = 100, db_path: str | Path = DB_PATH) -> pd.Data
         return pd.read_sql_query(
             "SELECT * FROM live_snapshots ORDER BY id DESC LIMIT ?",
             conn, params=(int(limit),)
+ )           

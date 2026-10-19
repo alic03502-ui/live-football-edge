@@ -1,36 +1,24 @@
 
 from __future__ import annotations
 
-import json
+import math
 import re
-from typing import Any
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
 
-import pandas as pd
 import requests
 import streamlit as st
 
-from model import (
-    prepare_history,
-    model_status,
-    pre_match_lambdas,
-    in_play_lambdas,
-    score_matrix,
-    markets,
-    top_final_scores,
-    walk_forward_evaluation,
-)
-from storage import (
-    init_db,
-    load_history,
-    save_history,
-    save_snapshot,
-    recent_snapshots,
-    save_final_result,
-)
-BASE_URL = "https://api.goal-api.com/v1"
-TIMEOUT = 20
 
-init_db()
+# =========================================================
+# Configuration
+# =========================================================
+
+BASE_URL = "https://api.goal-api.com/v1"
+TIMEOUT = 15
+DB_PATH = Path("data/live_football_edge.sqlite3")
 
 st.set_page_config(
     page_title="Live Football Edge",
@@ -39,123 +27,92 @@ st.set_page_config(
 )
 
 st.title("⚽ Live Football Edge")
-st.caption(
-    "Live GOAL API data · Optional historical model · "
-    "No bookmaker odds required for live monitoring"
+st.caption("Experimental live-only model · No historical uploads required")
+
+st.warning(
+    "TEST MODE: These are experimental estimates using generic "
+    "football scoring assumptions and available live statistics. "
+    "They are not historically validated or calibrated."
 )
 
-st.info(
-    "Live-only mode is supported. Without reliable historical results, "
-    "the app displays live data but does not generate betting probabilities."
-)
 
+# =========================================================
+# GOAL API
+# =========================================================
 
-# --------------------------------------------------
-# GOAL API connection
-# --------------------------------------------------
-
-def get_key() -> str:
+def get_api_key():
     try:
         return str(st.secrets.get("GOAL_API_KEY", "")).strip()
     except Exception:
         return ""
 
 
-def api_get(endpoint: str):
-    key = get_key()
+def api_get(endpoint):
+    key = get_api_key()
 
     if not key:
         raise RuntimeError(
-            "GOAL_API_KEY is missing from Streamlit Secrets."
+            "GOAL_API_KEY is missing. Add it to Streamlit Secrets."
         )
 
-    try:
-        response = requests.get(
-            f"{BASE_URL}/{endpoint.lstrip('/')}",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Accept": "application/json",
-            },
-            timeout=TIMEOUT,
-        )
+    response = requests.get(
+        f"{BASE_URL}/{endpoint.lstrip('/')}",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        },
+        timeout=TIMEOUT,
+    )
 
-        if response.status_code == 401:
-            raise RuntimeError(
-                "GOAL API rejected the key. Check Streamlit Secrets."
-            )
+    if response.status_code == 401:
+        raise RuntimeError("API key rejected. Check Streamlit Secrets.")
 
-        if response.status_code == 403:
-            raise RuntimeError(
-                "GOAL API denied access or this endpoint is not in your plan."
-            )
-
-        if response.status_code == 429:
-            raise RuntimeError(
-                "GOAL API quota/rate limit reached. Wait before retrying."
-            )
-
-        response.raise_for_status()
-        data = response.json()
-
-    except requests.RequestException as exc:
+    if response.status_code == 403:
         raise RuntimeError(
-            f"GOAL API request failed: {exc}"
-        ) from exc
+            "API access denied. Check whether your plan supports this endpoint."
+        )
 
-    if isinstance(data, dict):
-        if data.get("success") is False:
+    if response.status_code == 429:
+        raise RuntimeError("API rate limit reached. Wait before retrying.")
+
+    response.raise_for_status()
+    payload = response.json()
+
+    if isinstance(payload, dict):
+        if payload.get("success") is False:
             raise RuntimeError(
-                str(
-                    data.get("error")
-                    or data.get("message")
-                    or "GOAL API error"
-                )
+                str(payload.get("message", payload.get("error", "API error")))
             )
 
-        return data.get("data", data)
+        return payload.get("data", payload)
 
-    return data
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_live():
-    return as_list(api_get("fixtures/live"))
+    return payload
 
 
-def as_list(payload: Any) -> list[dict]:
+def as_list(payload):
     if isinstance(payload, list):
-        return [
-            item for item in payload
-            if isinstance(item, dict)
-        ]
+        return [x for x in payload if isinstance(x, dict)]
 
     if isinstance(payload, dict):
         for key in (
-            "fixtures",
-            "matches",
-            "results",
-            "events",
-            "items",
-            "data",
+            "fixtures", "matches", "results", "events",
+            "items", "data",
         ):
-            if isinstance(payload.get(key), list):
-                return [
-                    item for item in payload[key]
-                    if isinstance(item, dict)
-                ]
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
 
-        if any(
-            key in payload
-            for key in (
-                "id",
-                "fixtureId",
-                "fixture_id",
-                "match_id",
-            )
-        ):
+        if any(k in payload for k in (
+            "id", "fixtureId", "fixture_id", "match_id"
+        )):
             return [payload]
 
     return []
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_live_fixtures():
+    return as_list(api_get("fixtures/live"))
 
 
 def first(obj, *keys, default=None):
@@ -169,415 +126,424 @@ def first(obj, *keys, default=None):
     return default
 
 
-# --------------------------------------------------
-# Fixture and score parsing
-# --------------------------------------------------
+def team_name(value, fallback):
+    if isinstance(value, dict):
+        return str(first(
+            value, "name", "teamName", "team_name",
+            "displayName", default=fallback
+        ))
+
+    if isinstance(value, str):
+        return value
+
+    return fallback
+
 
 def parse_score(value):
     if isinstance(value, dict):
-        value = first(
-            value,
-            "score",
-            "goals",
-            "value",
-            "total",
-            "current",
-        )
+        value = first(value, "score", "goals", "value", "total")
 
     if value is None or isinstance(value, bool):
         return None
 
     try:
         number = float(str(value).strip())
-
         if number >= 0 and number.is_integer():
             return int(number)
-
-    except (TypeError, ValueError):
+    except (ValueError, TypeError):
         pass
 
     return None
 
 
-def score_for(item, side):
+def get_score(item, side):
     if side == "home":
-        keys = (
-            "homeTeamScore",
-            "home_score",
-            "homeScore",
-            "homeGoals",
-            "home_goals",
-            "match_hometeam_score",
-        )
-        nested_keys = (
-            "home",
-            "homeScore",
-            "home_score",
-            "homeTeam",
-            "homeTeamScore",
+        direct_keys = (
+            "homeTeamScore", "home_score", "homeScore",
+            "homeGoals", "home_goals", "match_hometeam_score",
         )
     else:
-        keys = (
-            "awayTeamScore",
-            "away_score",
-            "awayScore",
-            "awayGoals",
-            "away_goals",
-            "match_awayteam_score",
-        )
-        nested_keys = (
-            "away",
-            "awayScore",
-            "away_score",
-            "awayTeam",
-            "awayTeamScore",
+        direct_keys = (
+            "awayTeamScore", "away_score", "awayScore",
+            "awayGoals", "away_goals", "match_awayteam_score",
         )
 
-    value = parse_score(first(item, *keys))
+    score = parse_score(first(item, *direct_keys))
+    if score is not None:
+        return score
 
-    if value is not None:
-        return value
-
-    for container_name in (
-        "goals",
-        "score",
-        "scores",
-        "currentScore",
-    ):
-        container = item.get(container_name)
+    for container_key in ("score", "scores", "goals", "currentScore"):
+        container = item.get(container_key)
 
         if isinstance(container, dict):
-            value = parse_score(
-                first(
-                    container,
-                    *nested_keys,
-                    default=container.get(side),
-                )
+            if side in container:
+                score = parse_score(container[side])
+                if score is not None:
+                    return score
+
+            nested_keys = (
+                ("home", "homeScore", "home_score", "homeTeam")
+                if side == "home"
+                else ("away", "awayScore", "away_score", "awayTeam")
             )
 
-            if value is not None:
-                return value
+            score = parse_score(first(container, *nested_keys))
+            if score is not None:
+                return score
 
     return None
 
 
-def team_label(value, fallback):
-    if isinstance(value, str):
-        return value
-
-    if isinstance(value, dict):
-        return str(
-            first(
-                value,
-                "name",
-                "teamName",
-                "team_name",
-                "displayName",
-                default=fallback,
-            )
-        )
-
-    return fallback
-
-
-def normalize(item):
-    teams = (
-        item.get("teams")
-        if isinstance(item.get("teams"), dict)
-        else {}
-    )
+def normalize_fixture(item):
+    teams = item.get("teams", {})
+    if not isinstance(teams, dict):
+        teams = {}
 
     home = first(
-        teams,
-        "home",
-        "homeTeam",
-        "home_team",
+        teams, "home", "homeTeam", "home_team",
         default=first(
-            item,
-            "homeTeam",
-            "home_team",
-            "home",
-            "match_hometeam_name",
-            default="Home",
-        ),
+            item, "homeTeam", "home_team", "home",
+            "match_hometeam_name", default="Home"
+        )
     )
 
     away = first(
-        teams,
-        "away",
-        "awayTeam",
-        "away_team",
+        teams, "away", "awayTeam", "away_team",
         default=first(
-            item,
-            "awayTeam",
-            "away_team",
-            "away",
-            "match_awayteam_name",
-            default="Away",
-        ),
+            item, "awayTeam", "away_team", "away",
+            "match_awayteam_name", default="Away"
+        )
     )
 
-    status_obj = first(
-        item,
-        "status",
-        "fixtureStatus",
-        default={},
+    status = first(item, "status", "fixtureStatus", default="")
+    minute_value = first(
+        item, "matchMinute", "matchElapsed", "match_minute",
+        "elapsed", "minute",
+        default=first(item, "match_status", default=0)
     )
 
-    minute = first(
-        item,
-        "matchMinute",
-        "matchElapsed",
-        "match_minute",
-        "elapsed",
-        "minute",
-        default=first(
-            status_obj,
-            "elapsed",
-            "minute",
-            default=first(item, "match_status", default=0),
-        ),
-    )
+    if isinstance(minute_value, dict):
+        minute_value = first(
+            minute_value, "elapsed", "minute", default=0
+        )
 
-    if isinstance(minute, str):
-        match = re.search(r"\d+", minute)
-        minute = int(match.group()) if match else 0
+    if isinstance(minute_value, str):
+        match = re.search(r"\d+", minute_value)
+        minute_value = int(match.group()) if match else 0
 
     try:
-        minute = max(0, min(120, int(minute or 0)))
+        minute = max(0, min(120, int(minute_value or 0)))
     except (TypeError, ValueError):
         minute = 0
 
-    league_obj = (
-        item.get("league")
-        if isinstance(item.get("league"), dict)
-        else {}
-    )
+    league = item.get("league", {})
+    if not isinstance(league, dict):
+        league = {}
 
     return {
-        "id": str(
-            first(
-                item,
-                "id",
-                "fixtureId",
-                "fixture_id",
-                "match_id",
-                default="",
-            )
-        ),
-        "home_name": team_label(home, "Home"),
-        "away_name": team_label(away, "Away"),
-        "home_score": score_for(item, "home"),
-        "away_score": score_for(item, "away"),
+        "id": str(first(
+            item, "id", "fixtureId", "fixture_id", "match_id",
+            default=""
+        )),
+        "home": team_name(home, "Home"),
+        "away": team_name(away, "Away"),
+        "home_score": get_score(item, "home"),
+        "away_score": get_score(item, "away"),
         "minute": minute,
-        "league": str(
-            first(
-                league_obj,
-                "name",
-                "leagueName",
-                default=first(
-                    item,
-                    "leagueName",
-                    "league_name",
-                    default="Unknown league",
-                ),
+        "league": str(first(
+            league, "name", "leagueName",
+            default=first(
+                item, "leagueName", "league_name",
+                default="Unknown league"
             )
-        ),
-        "status": str(status_obj),
+        )),
         "raw": item,
     }
 
 
-# --------------------------------------------------
+# =========================================================
 # Statistics parsing
-# --------------------------------------------------
+# =========================================================
 
-def stat_value(rows, *names):
-    wanted = {name.lower() for name in names}
+def stat_label(row):
+    return str(first(
+        row, "type", "name", "label", "statistic",
+        "description", default=""
+    )).strip().lower()
+
+
+def numeric_value(value):
+    if isinstance(value, dict):
+        value = first(value, "value", "total", "amount")
+
+    if value is None:
+        return None
+
+    try:
+        return float(str(value).replace("%", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def flatten_statistics(payload):
+    """Convert common API statistics response shapes into rows."""
+    rows = []
+
+    def walk(obj):
+        if isinstance(obj, list):
+            for entry in obj:
+                walk(entry)
+            return
+
+        if not isinstance(obj, dict):
+            return
+
+        # A statistic represented as {type: ..., home: ..., away: ...}
+        label = stat_label(obj)
+        home_value = first(obj, "home", "homeValue", "home_value")
+        away_value = first(obj, "away", "awayValue", "away_value")
+
+        if label and (home_value is not None or away_value is not None):
+            rows.append({
+                "type": label,
+                "home": numeric_value(home_value),
+                "away": numeric_value(away_value),
+            })
+            return
+
+        # A statistic represented as {type: ..., value: ...}
+        if label and any(k in obj for k in ("value", "total", "amount")):
+            rows.append({
+                "type": label,
+                "value": numeric_value(first(
+                    obj, "value", "total", "amount"
+                )),
+            })
+            return
+
+        # Recurse through likely containers.
+        for key in (
+            "data", "statistics", "stats", "items",
+            "response", "results", "teams", "home", "away",
+        ):
+            if key in obj:
+                walk(obj[key])
+
+    walk(payload)
+    return rows
+
+
+def get_stat(rows, side, aliases):
+    aliases = {x.lower() for x in aliases}
 
     for row in rows:
-        if not isinstance(row, dict):
+        label = row.get("type", "")
+        if label not in aliases:
             continue
 
-        label = str(
-            first(
-                row,
-                "type",
-                "name",
-                "label",
-                "statistic",
-                default="",
-            )
-        ).lower()
+        if row.get(side) is not None:
+            return row[side]
 
-        if label not in wanted:
+        if row.get("value") is not None:
+            # A value-only row has no verified team attribution.
             continue
-
-        value = first(row, "value", "total", "amount")
-
-        try:
-            return float(
-                str(value).replace("%", "").strip()
-            )
-        except (TypeError, ValueError):
-            return None
 
     return None
 
 
-# --------------------------------------------------
-# Optional historical data
-# No historical dataset is bundled or required.
-# --------------------------------------------------
+# =========================================================
+# Experimental live-only Poisson model
+# =========================================================
 
-with st.sidebar:
-    st.header("Historical data (optional)")
-
-    st.caption(
-        "The live dashboard works without CCV historical data. "
-        "Import completed results only if you already have a reliable dataset."
-    )
-
-    with st.expander(
-        "Import completed results",
-        expanded=False,
-    ):
-        st.write("Required CSV columns:")
-
-        st.code(
-            "date,home_team,away_team,home_goals,away_goals"
-        )
-
-        uploaded = st.file_uploader(
-            "Optional historical CSV",
-            type=["csv"],
-        )
-
-        if uploaded is not None:
-            if st.button(
-                "Import history",
-                use_container_width=True,
-            ):
-                try:
-                    historical = prepare_history(
-                        pd.read_csv(uploaded)
-                    )
-
-                    count = save_history(historical)
-
-                    st.success(
-                        f"Imported/updated {count} historical rows."
-                    )
-
-                    st.rerun()
-
-                except Exception as exc:
-                    st.error(
-                        f"History import failed: {exc}"
-                    )
-
-
-history = load_history()
-
-with st.expander(
-    "Historical database status",
-    expanded=False,
-):
-    st.write(
-        f"Stored completed matches: **{len(history)}**"
-    )
-
-    if history.empty:
-        st.info(
-            "No historical dataset is installed. Live monitoring "
-            "is available; betting predictions and historical "
-            "evaluation are disabled."
-        )
-    else:
-        st.write(
-            f"Date range: {history.date.min()} — {history.date.max()}"
-        )
-
-        st.dataframe(
-            history.tail(10),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-if not history.empty:
-    st.subheader("Historical evaluation")
-
-    if st.button("Run walk-forward evaluation"):
-        with st.spinner("Evaluating historical matches..."):
-            try:
-                report = walk_forward_evaluation(history)
-
-                if report.empty:
-                    st.warning(
-                        "Not enough usable history to evaluate."
-                    )
-                else:
-                    st.session_state["evaluation_report"] = report
-
-            except Exception as exc:
-                st.error(
-                    f"Evaluation failed: {exc}"
-                )
-
-    if "evaluation_report" in st.session_state:
-        report = st.session_state["evaluation_report"]
-
-        if "brier_1x2" in report.columns:
-            brier = report["brier_1x2"].mean()
-
-            st.metric(
-                "Mean multiclass Brier score (lower is better)",
-                f"{brier:.4f}",
-            )
-
-        st.dataframe(
-            report.tail(100),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-# --------------------------------------------------
-# Load live fixtures
-# --------------------------------------------------
-
-st.divider()
-
-col1, col2 = st.columns([4, 1])
-
-with col1:
-    st.write(
-        "Choose a live fixture. Responses are cached for 60 seconds "
-        "to reduce API requests."
-    )
-
-with col2:
-    refresh = st.button(
-        "Refresh fixtures",
-        use_container_width=True,
-    )
-
-if refresh:
-    fetch_live.clear()
-
-try:
-    fixtures = [
-        normalize(item)
-        for item in fetch_live()
+def poisson_probabilities(lam, max_goals=10):
+    lam = max(0.0, float(lam))
+    probabilities = [
+        math.exp(-lam) * (lam ** k) / math.factorial(k)
+        for k in range(max_goals + 1)
     ]
 
-except Exception as exc:
-    st.error(
-        f"Could not load live fixtures: {exc}"
+    total = sum(probabilities)
+    if total > 0:
+        probabilities = [p / total for p in probabilities]
+
+    return probabilities
+
+
+def live_model(
+    minute,
+    home_score,
+    away_score,
+    home_sot=None,
+    away_sot=None,
+    home_reds=0,
+    away_reds=0,
+):
+    """
+    Generic experimental model.
+    It does not know team strength and is not calibrated.
+    """
+
+    # Generic baseline scoring rates per 90 minutes.
+    home_rate = 1.40
+    away_rate = 1.10
+
+    # Only adjust when shots on target are actually available.
+    if home_sot is not None and away_sot is not None:
+        home_rate *= max(0.65, min(1.45, 0.90 + 0.06 * home_sot))
+        away_rate *= max(0.65, min(1.45, 0.90 + 0.06 * away_sot))
+
+    # Small experimental red-card adjustment, if known.
+    home_rate *= max(0.55, 1.0 - 0.25 * home_reds + 0.15 * away_reds)
+    away_rate *= max(0.55, 1.0 - 0.25 * away_reds + 0.15 * home_reds)
+
+    # Use 95 minutes as the default regulation-time horizon.
+    # If already beyond 95 minutes, allow up to 5 additional minutes.
+    remaining = max(0, min(100 - minute, 100)) / 90.0
+
+    home_remaining = home_rate * remaining
+    away_remaining = away_rate * remaining
+
+    home_goals_probs = poisson_probabilities(home_remaining)
+    away_goals_probs = poisson_probabilities(away_remaining)
+
+    # Matrix contains probabilities of additional goals from now.
+    matrix = [
+        [home_goals_probs[h] * away_goals_probs[a]
+         for a in range(len(away_goals_probs))]
+        for h in range(len(home_goals_probs))
+    ]
+
+    result_probs = {"1": 0.0, "X": 0.0, "2": 0.0}
+    over15 = over25 = over35 = under25 = btts = 0.0
+    score_candidates = []
+
+    for add_home, row in enumerate(matrix):
+        for add_away, probability in enumerate(row):
+            final_home = home_score + add_home
+            final_away = away_score + add_away
+            total_goals = final_home + final_away
+
+            if final_home > final_away:
+                result_probs["1"] += probability
+            elif final_home == final_away:
+                result_probs["X"] += probability
+            else:
+                result_probs["2"] += probability
+
+            if total_goals >= 2:
+                over15 += probability
+            if total_goals >= 3:
+                over25 += probability
+            if total_goals >= 4:
+                over35 += probability
+            if total_goals <= 2:
+                under25 += probability
+            if final_home >= 1 and final_away >= 1:
+                btts += probability
+
+            score_candidates.append((
+                probability, final_home, final_away
+            ))
+
+    # Normalize probabilities to handle the tiny truncated Poisson tail.
+    total = sum(result_probs.values())
+    if total > 0:
+        result_probs = {
+            key: value / total
+            for key, value in result_probs.items()
+        }
+
+    markets = {
+        "Home win": result_probs["1"],
+        "Draw": result_probs["X"],
+        "Away win": result_probs["2"],
+        "Over 1.5 goals": over15,
+        "Under 1.5 goals": 1.0 - over15,
+        "Over 2.5 goals": over25,
+        "Under 2.5 goals": under25,
+        "Over 3.5 goals": over35,
+        "Under 3.5 goals": 1.0 - over35,
+        "Both teams to score — Yes": btts,
+        "Both teams to score — No": 1.0 - btts,
+        "Home or draw (1X)": result_probs["1"] + result_probs["X"],
+        "Away or draw (X2)": result_probs["X"] + result_probs["2"],
+    }
+
+    score_candidates.sort(reverse=True)
+    top_scores = score_candidates[:5]
+
+    return markets, top_scores, home_remaining, away_remaining
+
+
+# =========================================================
+# Local snapshot storage
+# =========================================================
+
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS live_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at TEXT,
+                fixture_id TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                minute INTEGER,
+                home_score INTEGER,
+                away_score INTEGER,
+                payload TEXT
+            )
+        """)
+
+
+def save_snapshot(fixture):
+    init_db()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO live_snapshots
+            (captured_at, fixture_id, home_team, away_team,
+             minute, home_score, away_score, payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now(timezone.utc).isoformat(),
+            fixture["id"],
+            fixture["home"],
+            fixture["away"],
+            fixture["minute"],
+            fixture["home_score"],
+            fixture["away_score"],
+            json.dumps(fixture["raw"], ensure_ascii=False, default=str),
+        ))
+
+
+# =========================================================
+# Sidebar and fixture refresh
+# =========================================================
+
+with st.sidebar:
+    st.header("Model settings")
+    st.write("Mode: **Live-only experimental**")
+    st.write("Historical CSV: **Not required**")
+    st.caption(
+        "This model uses generic team scoring rates. "
+        "It does not estimate the real strength of individual teams."
     )
+
+if st.button("Refresh fixtures", use_container_width=True):
+    fetch_live_fixtures.clear()
+
+try:
+    raw_fixtures = fetch_live_fixtures()
+except Exception as exc:
+    st.error(f"Could not load live fixtures: {exc}")
     st.stop()
 
+fixtures = [
+    normalize_fixture(item)
+    for item in raw_fixtures
+]
 
 fixtures = [
     fixture for fixture in fixtures
@@ -585,482 +551,182 @@ fixtures = [
 ]
 
 if not fixtures:
-    st.info(
-        "No live fixtures were returned. This can happen when "
-        "no matches covered by the API are currently live."
-    )
+    st.info("No live fixtures were returned by the API right now.")
     st.stop()
 
+leagues = ["All leagues"] + sorted({
+    fixture["league"] for fixture in fixtures
+})
 
-league_options = ["All leagues"] + sorted(
-    {
-        fixture["league"]
-        for fixture in fixtures
-    }
-)
-
-selected_league = st.selectbox(
-    "League",
-    league_options,
-)
+selected_league = st.selectbox("League", leagues)
 
 if selected_league != "All leagues":
     fixtures = [
-        fixture for fixture in fixtures
-        if fixture["league"] == selected_league
+        f for f in fixtures if f["league"] == selected_league
     ]
 
 if not fixtures:
-    st.info("No fixtures are available for this league.")
+    st.info("No live matches in this league.")
     st.stop()
 
 
-def fixture_text(fixture):
-    home_score = (
-        "—"
-        if fixture["home_score"] is None
-        else str(fixture["home_score"])
-    )
-
-    away_score = (
-        "—"
-        if fixture["away_score"] is None
-        else str(fixture["away_score"])
-    )
+def fixture_label(f):
+    hs = "?" if f["home_score"] is None else f["home_score"]
+    aws = "?" if f["away_score"] is None else f["away_score"]
 
     return (
-        f"{fixture['home_name']} {home_score}–{away_score} "
-        f"{fixture['away_name']} · {fixture['minute']}' "
-        f"· {fixture['league']}"
+        f"{f['home']} {hs}–{aws} {f['away']} "
+        f"· {f['minute']}' · {f['league']}"
     )
 
 
 selected = st.selectbox(
     "Live match",
     fixtures,
-    format_func=fixture_text,
+    format_func=fixture_label,
 )
-
-
-home_score_display = (
-    "—"
-    if selected["home_score"] is None
-    else str(selected["home_score"])
-)
-
-away_score_display = (
-    "—"
-    if selected["away_score"] is None
-    else str(selected["away_score"])
-)
-
-st.subheader(
-    f"{selected['home_name']} {home_score_display} – "
-    f"{away_score_display} {selected['away_name']}"
-)
-
-st.caption(
-    f"{selected['league']} · {selected['minute']}' "
-    f"· Fixture ID {selected['id']}"
-)
-
-
-# --------------------------------------------------
-# Stop on unrecognized scores.
-# Never silently assume 0–0.
-# --------------------------------------------------
 
 if (
     selected["home_score"] is None
     or selected["away_score"] is None
 ):
     st.error(
-        "One or both scores are missing or unrecognized. "
+        "The API did not provide both scores in a recognized format. "
         "Predictions are paused rather than assuming 0–0."
     )
 
-    with st.expander("Score parser diagnostics"):
-        st.write(list(selected["raw"].keys()))
+    with st.expander("Fixture response diagnostics"):
         st.json(selected["raw"])
 
     st.stop()
 
 
-# --------------------------------------------------
-# Fetch live statistics and events
-# --------------------------------------------------
-
-try:
-    stats = as_list(
-        api_get(
-            f"fixtures/{selected['id']}/statistics"
-        )
-    )
-
-    # Events are fetched for future inspection, but red-card
-    # adjustments are not applied because team attribution has
-    # not been verified for this API response.
-    events = as_list(
-        api_get(
-            f"fixtures/{selected['id']}/events"
-        )
-    )
-
-except Exception as exc:
-    st.warning(
-        f"Live stats/events unavailable: {exc}. "
-        "Unavailable statistics remain unknown."
-    )
-
-    stats = []
-    events = []
+st.subheader(
+    f"{selected['home']} {selected['home_score']} – "
+    f"{selected['away_score']} {selected['away']}"
+)
+st.caption(
+    f"{selected['league']} · {selected['minute']}' "
+    f"· Fixture ID {selected['id']}"
+)
 
 
-home_stats = []
-away_stats = []
-
-for row in stats:
-    team_obj = (
-        row.get("team")
-        if isinstance(row.get("team"), dict)
-        else {}
-    )
-
-    team_name = str(
-        first(
-            team_obj,
-            "name",
-            default=first(
-                row,
-                "teamName",
-                "team",
-                default="",
-            ),
-        )
-    ).lower()
-
-    nested_stats = first(
-        row,
-        "statistics",
-        "stats",
-        "items",
-        default=None,
-    )
-
-    if isinstance(nested_stats, list):
-        target = (
-            home_stats
-            if "home" in team_name
-            else away_stats
-            if "away" in team_name
-            else None
-        )
-
-        if target is not None:
-            target.extend(nested_stats)
-
-    else:
-        name = first(
-            row,
-            "type",
-            "name",
-            "label",
-            "statistic",
-        )
-
-        home_value = first(
-            row,
-            "home",
-            "homeValue",
-            "home_value",
-        )
-
-        away_value = first(
-            row,
-            "away",
-            "awayValue",
-            "away_value",
-        )
-
-        if name is not None:
-            if home_value is not None:
-                home_stats.append(
-                    {
-                        "type": name,
-                        "value": home_value,
-                    }
-                )
-
-            if away_value is not None:
-                away_stats.append(
-                    {
-                        "type": name,
-                        "value": away_value,
-                    }
-                )
-
-
-# --------------------------------------------------
-# Display available live statistics
-# --------------------------------------------------
+# =========================================================
+# Fetch statistics, but keep the model usable if unavailable
+# =========================================================
 
 stats_rows = []
-
-stat_definitions = [
-    (
-        "Shots on target",
-        (
-            "Shots on Goal",
-            "Shots on Target",
-            "Shots on target",
-        ),
-    ),
-    (
-        "Total shots",
-        ("Total Shots", "Shots"),
-    ),
-    (
-        "Possession",
-        ("Ball Possession", "Possession"),
-    ),
-    (
-        "Corners",
-        ("Corner Kicks", "Corners"),
-    ),
-    (
-        "xG",
-        (
-            "expected_goals",
-            "Expected Goals",
-            "xG",
-        ),
-    ),
-]
-
-for label, aliases in stat_definitions:
-    home_value = stat_value(
-        home_stats,
-        *aliases,
-    )
-
-    away_value = stat_value(
-        away_stats,
-        *aliases,
-    )
-
-    if (
-        home_value is not None
-        or away_value is not None
-    ):
-        stats_rows.append(
-            {
-                "Statistic": label,
-                selected["home_name"]: home_value,
-                selected["away_name"]: away_value,
-            }
-        )
-
-
-if stats_rows:
-    st.subheader("Available live statistics")
-
-    st.dataframe(
-        stats_rows,
-        hide_index=True,
-        use_container_width=True,
-    )
-else:
-    st.info(
-        "No recognized live statistics were returned by the API."
-    )
-
-
-# --------------------------------------------------
-# Save live snapshot
-# --------------------------------------------------
+stats_error = None
 
 try:
-    save_snapshot(
-        selected,
-        json.dumps(
-            selected["raw"],
-            ensure_ascii=False,
-            default=str,
-        ),
+    stats_payload = api_get(
+        f"fixtures/{selected['id']}/statistics"
     )
-
+    stats_rows = flatten_statistics(stats_payload)
 except Exception as exc:
+    stats_error = str(exc)
+
+home_sot = get_stat(
+    stats_rows,
+    "home",
+    {"shots on target", "shots on goal", "shots on target"},
+)
+away_sot = get_stat(
+    stats_rows,
+    "away",
+    {"shots on target", "shots on goal", "shots on target"},
+)
+
+if stats_error:
     st.warning(
-        f"Could not save this snapshot: {exc}"
+        f"Live statistics could not be loaded: {stats_error}. "
+        "The model will use generic assumptions without shot adjustments."
     )
 
-
-# --------------------------------------------------
-# Predictions: require reliable historical input
-# --------------------------------------------------
-
-if history.empty:
+if home_sot is None or away_sot is None:
     st.info(
-        "LIVE-ONLY MODE: Live fixtures, scores, recognized statistics, "
-        "and snapshots are available. No betting probabilities are "
-        "generated because historical team-strength data is missing."
-    )
-
-else:
-    status = model_status(
-        history,
-        selected["home_name"],
-        selected["away_name"],
-    )
-
-    if not status.ready:
-        st.warning(
-            f"NO PREDICTION / INSUFFICIENT DATA: {status.reason}"
-        )
-
-    else:
-        home_pre, away_pre = pre_match_lambdas(
-            history,
-            selected["home_name"],
-            selected["away_name"],
-        )
-
-        home_sot = stat_value(
-            home_stats,
-            "Shots on Goal",
-            "Shots on Target",
-            "Shots on target",
-        )
-
-        away_sot = stat_value(
-            away_stats,
-            "Shots on Goal",
-            "Shots on Target",
-            "Shots on target",
-        )
-
-        # Red cards are deliberately not inferred from event text
-        # until the API's event team attribution is verified.
-        home_reds = 0
-        away_reds = 0
-
-        home_remaining, away_remaining = in_play_lambdas(
-            home_pre,
-            away_pre,
-            selected["minute"],
-            selected["home_score"],
-            selected["away_score"],
-            home_sot,
-            away_sot,
-            home_reds,
-            away_reds,
-        )
-
-        matrix = score_matrix(
-            home_remaining,
-            away_remaining,
-        )
-
-        probs = markets(
-            matrix,
-            selected["home_score"],
-            selected["away_score"],
-        )
-
-        st.subheader("Experimental live model estimates")
-
-        st.caption(
-            "The model uses optional imported historical results and "
-            "a heuristic in-play adjustment. These estimates have not "
-            "been independently validated or calibrated."
-        )
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            f"{selected['home_name']} win",
-            f"{probs['1']:.1%}",
-        )
-
-        col2.metric(
-            "Draw",
-            f"{probs['X']:.1%}",
-        )
-
-        col3.metric(
-            f"{selected['away_name']} win",
-            f"{probs['2']:.1%}",
-        )
-
-        with st.expander("Double chance and goal markets"):
-            market_rows = [
-                {
-                    "Market": name,
-                    "Probability": f"{value:.1%}",
-                }
-                for name, value in probs.items()
-            ]
-
-            st.dataframe(
-                market_rows,
-                hide_index=True,
-                use_container_width=True,
-            )
-
-        st.subheader("Most likely final scores")
-
-        score_rows = [
-            {
-                "Projected final score": (
-                    f"{selected['home_name']} {home_goals}–"
-                    f"{away_goals} {selected['away_name']}"
-                ),
-                "Probability": f"{probability:.1%}",
-            }
-            for probability, home_goals, away_goals
-            in top_final_scores(
-                matrix,
-                selected["home_score"],
-                selected["away_score"],
-            )
-        ]
-
-        st.dataframe(
-            score_rows,
-            hide_index=True,
-            use_container_width=True,
-        )
-
-
-# --------------------------------------------------
-# Recent snapshots
-# --------------------------------------------------
-
-st.subheader("Recent saved live snapshots")
-
-snapshots = recent_snapshots(20)
-
-if not snapshots.empty:
-    st.dataframe(
-        snapshots,
-        use_container_width=True,
-        hide_index=True,
-    )
-else:
-    st.caption(
-        "Snapshots will appear here after the app saves observations."
+        "Shots on target are unavailable or not recognized. "
+        "Predictions will use generic scoring rates."
     )
 
 
-# --------------------------------------------------
-# Limitations
-# --------------------------------------------------
+# =========================================================
+# Generate predictions immediately — no historical data
+# =========================================================
+
+markets, top_scores, home_remaining, away_remaining = live_model(
+    minute=selected["minute"],
+    home_score=selected["home_score"],
+    away_score=selected["away_score"],
+    home_sot=home_sot,
+    away_sot=away_sot,
+)
+
+st.subheader("Live match predictions")
+
+st.caption(
+    "Experimental estimates only. Generic scoring assumptions are used; "
+    "team-specific strength and historical calibration are absent."
+)
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Home win", f"{markets['Home win']:.1%}")
+c2.metric("Draw", f"{markets['Draw']:.1%}")
+c3.metric("Away win", f"{markets['Away win']:.1%}")
+
+st.subheader("Goal and double-chance markets")
+
+market_rows = [
+    {"Market": name, "Probability": f"{probability:.1%}"}
+    for name, probability in markets.items()
+]
+
+st.dataframe(
+    market_rows,
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.subheader("Most likely final scores")
+
+score_rows = [
+    {
+        "Projected final score": f"{selected['home']} {h}–{a} {selected['away']}",
+        "Probability": f"{probability:.1%}",
+    }
+    for probability, h, a in top_scores
+]
+
+st.dataframe(
+    score_rows,
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.caption(
+    f"Estimated remaining goals: {selected['home']} "
+    f"{home_remaining:.2f} · {selected['away']} {away_remaining:.2f}"
+)
+
+
+# =========================================================
+# Show raw stats and save snapshot
+# =========================================================
+
+if stats_rows:
+    with st.expander("Recognized statistics (debug view)"):
+        st.json(stats_rows)
+
+with st.expander("Raw API response (debug view)"):
+    st.json(selected["raw"])
+
+try:
+    save_snapshot(selected)
+except Exception as exc:
+    st.warning(f"Could not save snapshot: {exc}")
 
 st.divider()
-
-st.warning(
-    "Important limitations: live statistics depend on the GOAL API "
-    "response. Historical predictions are experimental and have not "
-    "been independently validated or calibrated. Do not treat model "
-    "probabilities as guaranteed outcomes."
+st.caption(
+    "This version is intended for testing model behaviour and data parsing. "
+    "Do not interpret these probabilities as proven betting edges."
 )

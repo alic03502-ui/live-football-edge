@@ -1059,8 +1059,8 @@ else:
 st.divider()
 
 st.warning(
-    "NO BOOKMAKER ODDS SOURCE IS CONNECTED. No EV/edge is calculated. "
-    "Live-only mode does not generate betting probabilities. "
-    "When historical results are imported, model estimates remain "
-    "experimental and should not be treated as validated betting advice."
+    "Important limitations: live statistics depend on the GOAL API "
+    "response. Historical predictions are experimental and have not "
+    "been independently validated or calibrated. Do not treat model "
+    "probabilities as guaranteed outcomes."
 )

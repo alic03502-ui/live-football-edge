@@ -1,39 +1,24 @@
-# Live Football Edge — v1
+LIVE FOOTBALL EDGE — SAFE INCREMENTAL UPGRADE
 
-A Streamlit live-match dashboard using GOAL API live fixtures plus an optional local historical-results dataset.
+This ZIP is an add-on, not a replacement repository. It does not touch API
+fetching, Streamlit layout, GOAL_API_KEY secrets, SQLite storage, or requirements.
 
-## What this version includes
+INSTALL:
+1. Download and unzip.
+2. Save a backup copy of your current app.py first.
+3. In app.py, find the section "Experimental live-only Poisson model".
+4. Replace ONLY the existing poisson_probabilities() and live_model() functions
+   with the versions in live_model_upgrade.py. Do not replace other code.
+5. Commit, wait for Streamlit Cloud to redeploy, then check a live match.
+6. If anything breaks, restore those two functions from your backup.
 
-- Defensive score parsing: unknown scores stay unknown; the app pauses predictions rather than converting them to 0–0.
-- API error handling and caching for live fixtures; manual refresh is available.
-- Historical completed-results CSV import into local SQLite.
-- Recency-weighted Poisson baseline with team attack/defence rates and shrinkage toward league averages.
-- Live remaining-goals adjustment using time remaining and available shots-on-target.
-- 1X2, double chance, totals, BTTS, team-goal probabilities and most likely final scores.
-- SQLite storage for live snapshots.
-- Expanding-window walk-forward evaluation and multiclass Brier score.
-- Explicit insufficient-data / no-bet gate.
-- No bookmaker odds, EV, or edge integration.
+No new packages or historical uploads are required.
+Optional local test: python -m unittest -v test_live_model_upgrade.py
 
-## Setup
-
-1. Install requirements: `pip install -r requirements.txt`
-2. Set `GOAL_API_KEY` in Streamlit Secrets.
-3. Start: `streamlit run app.py`
-4. In the sidebar, import a CSV with columns:
-
-```csv
-date,home_team,away_team,home_goals,away_goals
-2025-08-01,Team A,Team B,2,1
-```
-
-Use historical results from the competition(s) you intend to analyze. Team names must match the live API names closely, otherwise the model will treat them as different teams.
-
-## Important limitations
-
-- The GOAL API endpoint used for live fixtures is `fixtures/live`; statistics and events use `fixtures/{id}/statistics` and `fixtures/{id}/events`, matching the existing project integration. Your API plan may not allow every endpoint.
-- Historical results are imported by CSV; this version does not assume an undocumented GOAL API historical endpoint exists.
-- The baseline is not automatically calibrated. A low Brier score compared with a baseline and good reliability plots over a large out-of-sample sample are needed before interpreting probabilities as dependable.
-- The in-play adjustment is a transparent heuristic, not a trained live model. Red-card attribution can vary by provider, so it should be validated against actual GOAL API event payloads before being relied on.
-- SQLite persists on the current filesystem. Some hosted Streamlit environments may reset local files during redeploys; back up the database or use persistent storage if needed.
-- This project does not promise positive betting returns. A no-bet/data-quality rule is intentional.
+LIMITATIONS:
+This is still an experimental heuristic, not a trained or calibrated model.
+It adds a small capped adjustment when a team is trailing late and keeps
+probability calculations consistent. Generic home/away baseline rates remain.
+Red-card effects apply only if the caller passes real red-card counts; the
+current app may not yet parse/pass those counts. SOT effects require correctly
+recognized shots-on-target values. No betting accuracy or profit is guaranteed.

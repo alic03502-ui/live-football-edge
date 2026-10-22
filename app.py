@@ -863,20 +863,18 @@ def live_model(
     home_reds = max(0, int(home_reds or 0))
     away_reds = max(0, int(away_reds or 0))
 
-    # Generic baselines.
+    # Baseline expected goals per 90 minutes.
     home_rate = 1.40
     away_rate = 1.10
-
     history_used = False
 
-    # Historical attack/defence adjustment.
+    # Historical attack and defence adjustments.
     if historical:
         h = historical["home"]
         a = historical["away"]
         league_avg = historical["league_avg"]
 
         if h["matches"] >= 3 or a["matches"] >= 3:
-            # Use the league's average scoring environment as the base.
             home_rate = max(
                 0.55,
                 min(
@@ -893,25 +891,37 @@ def live_model(
             )
             history_used = True
 
+    # Live shots-on-target adjustment.
     if home_sot is not None:
         home_rate *= max(
-            0.80, min(1.25, 0.96 + 0.035 * max(0, float(home_sot)))
+            0.80,
+            min(1.25, 0.96 + 0.035 * max(0, float(home_sot))),
         )
 
     if away_sot is not None:
         away_rate *= max(
-            0.80, min(1.25, 0.96 + 0.035 * max(0, float(away_sot)))
+            0.80,
+            min(1.25, 0.96 + 0.035 * max(0, float(away_sot))),
         )
 
-    home_rate *= max(0.55, 1.0 - 0.22 * home_reds + 0.12 * away_reds)
-    away_rate *= max(0.55, 1.0 - 0.22 * away_reds + 0.12 * home_reds)
+    # Red-card adjustment.
+    home_rate *= max(
+        0.55,
+        1.0 - 0.22 * home_reds + 0.12 * away_reds,
+    )
+    away_rate *= max(
+        0.55,
+        1.0 - 0.22 * away_reds + 0.12 * home_reds,
+    )
 
+    # Trailing teams may attack more aggressively late in the match.
     if minute >= 55 and home_score != away_score:
         if home_score < away_score:
             home_rate *= 1.10
         else:
             away_rate *= 1.10
 
+    # Estimate remaining goals.
     remaining_minutes = max(0, min(100 - minute, 100))
     fraction = remaining_minutes / 90.0
 
@@ -921,74 +931,200 @@ def live_model(
     hp = poisson_probabilities(home_remaining)
     ap = poisson_probabilities(away_remaining)
 
-    result = {"1": 0.0, "X": 0.0, "2": 0.0}
-    over15 = over25 = over35 = btts = 0.0
-    score_candidates = []
-
+    # Probability distribution of final scores.
+    score_grid = []
     for add_home, ph in enumerate(hp):
         for add_away, pa in enumerate(ap):
             probability = ph * pa
             final_home = home_score + add_home
             final_away = away_score + add_away
-            total_goals = final_home + final_away
 
-            if final_home > final_away:
-                result["1"] += probability
-            elif final_home == final_away:
-                result["X"] += probability
-            else:
-                result["2"] += probability
-
-            if total_goals >= 2:
-                over15 += probability
-            if total_goals >= 3:
-                over25 += probability
-            if total_goals >= 4:
-                over35 += probability
-            if final_home >= 1 and final_away >= 1:
-                btts += probability
-
-            score_candidates.append(
+            score_grid.append(
                 (probability, final_home, final_away)
             )
 
-    total = sum(sum(row) for row in [
-        [hp[h] * ap[a] for a in range(len(ap))]
-        for h in range(len(hp))
-    ])
+    total_probability = sum(row[0] for row in score_grid)
 
-    if total > 0:
-        result = {key: value / total for key, value in result.items()}
-        over15 /= total
-        over25 /= total
-        over35 /= total
-        btts /= total
-        score_candidates = [
-            (p / total, home, away)
-            for p, home, away in score_candidates
+    if total_probability > 0:
+        score_grid = [
+            (p / total_probability, home, away)
+            for p, home, away in score_grid
         ]
 
+    # Helpers to calculate markets from the same score distribution.
+    def probability_where(condition):
+        return sum(
+            probability
+            for probability, home, away in score_grid
+            if condition(home, away)
+        )
+
+    # Full-time 1X2.
+    home_win = probability_where(lambda h, a: h > a)
+    draw = probability_where(lambda h, a: h == a)
+    away_win = probability_where(lambda h, a: h < a)
+
+    # Double chance.
+    home_or_draw = home_win + draw
+    away_or_draw = away_win + draw
+    either_team_wins = home_win + away_win
+
     markets = {
-        "Home win": result["1"],
-        "Draw": result["X"],
-        "Away win": result["2"],
-        "Over 1.5 goals": over15,
-        "Under 1.5 goals": 1.0 - over15,
-        "Over 2.5 goals": over25,
-        "Under 2.5 goals": 1.0 - over25,
-        "Over 3.5 goals": over35,
-        "Under 3.5 goals": 1.0 - over35,
-        "Both teams to score — Yes": btts,
-        "Both teams to score — No": 1.0 - btts,
-        "Home or draw (1X)": result["1"] + result["X"],
-        "Away or draw (X2)": result["X"] + result["2"],
+        "Home win": home_win,
+        "Draw": draw,
+        "Away win": away_win,
+        "Home or draw (1X)": home_or_draw,
+        "Away or draw (X2)": away_or_draw,
+        "Either team wins (12)": either_team_wins,
     }
 
-    score_candidates.sort(key=lambda item: item[0], reverse=True)
+    # Full-time total-goal markets.
+    current_total = home_score + away_score
 
-    return markets, score_candidates[:5], home_remaining, away_remaining, history_used
+    for line in (0.5, 1.5, 2.5, 3.5, 4.5, 5.5):
+        over = probability_where(
+            lambda h, a, line=line: h + a > line
+        )
+        label = f"{line:.1f}"
 
+        markets[f"Over {label} total goals"] = over
+        markets[f"Under {label} total goals"] = 1.0 - over
 
+    # Both teams to score.
+    btts_yes = probability_where(
+        lambda h, a: h >= 1 and a >= 1
+    )
+
+    markets["Both teams to score — Yes"] = btts_yes
+    markets["Both teams to score — No"] = 1.0 - btts_yes
+
+    # Team total goals.
+    for side, team_score in (
+        ("Home", home_score),
+        ("Away", away_score),
+    ):
+        for line in (0.5, 1.5, 2.5, 3.5):
+            over = probability_where(
+                lambda h, a, side=side, line=line: (
+                    h > line if side == "Home" else a > line
+                )
+            )
+
+            label = f"{line:.1f}"
+            markets[f"{side} team over {label} goals"] = over
+            markets[f"{side} team under {label} goals"] = 1.0 - over
+
+    # Win to nil.
+    home_win_to_nil = probability_where(
+        lambda h, a: h > a and a == 0
+    )
+    away_win_to_nil = probability_where(
+        lambda h, a: a > h and h == 0
+    )
+
+    markets["Home win to nil"] = home_win_to_nil
+    markets["Away win to nil"] = away_win_to_nil
+
+    # Result plus total-goal combinations.
+    combinations = {
+        "Home win + Over 1.5 goals": (
+            lambda h, a: h > a and h + a >= 2
+        ),
+        "Home win + Over 2.5 goals": (
+            lambda h, a: h > a and h + a >= 3
+        ),
+        "Away win + Over 1.5 goals": (
+            lambda h, a: a > h and h + a >= 2
+        ),
+        "Away win + Over 2.5 goals": (
+            lambda h, a: a > h and h + a >= 3
+        ),
+        "1X + Over 1.5 goals": (
+            lambda h, a: h >= a and h + a >= 2
+        ),
+        "X2 + Over 1.5 goals": (
+            lambda h, a: a >= h and h + a >= 2
+        ),
+        "12 + Over 1.5 goals": (
+            lambda h, a: h != a and h + a >= 2
+        ),
+        "12 + Over 2.5 goals": (
+            lambda h, a: h != a and h + a >= 3
+        ),
+    }
+
+    for market_name, condition in combinations.items():
+        markets[market_name] = probability_where(condition)
+
+    # Estimated half-time markets are provided only during the first half.
+    # These are rough estimates, not a separately calibrated half-time model.
+    if minute <= 45:
+        halftime_fraction = max(0, 45 - minute) / 90.0
+
+        hhp = poisson_probabilities(home_rate * halftime_fraction)
+        hap = poisson_probabilities(away_rate * halftime_fraction)
+
+        halftime_grid = []
+
+        for add_home, ph in enumerate(hhp):
+            for add_away, pa in enumerate(hap):
+                halftime_grid.append(
+                    (
+                        ph * pa,
+                        home_score + add_home,
+                        away_score + add_away,
+                    )
+                )
+
+        ht_total = sum(row[0] for row in halftime_grid)
+
+        if ht_total > 0:
+            halftime_grid = [
+                (p / ht_total, h, a)
+                for p, h, a in halftime_grid
+            ]
+
+        def ht_probability_where(condition):
+            return sum(
+                p for p, h, a in halftime_grid
+                if condition(h, a)
+            )
+
+        markets["Half-time home win (estimated)"] = (
+            ht_probability_where(lambda h, a: h > a)
+        )
+        markets["Half-time draw (estimated)"] = (
+            ht_probability_where(lambda h, a: h == a)
+        )
+        markets["Half-time away win (estimated)"] = (
+            ht_probability_where(lambda h, a: h < a)
+        )
+
+        for line in (0.5, 1.5, 2.5):
+            over = ht_probability_where(
+                lambda h, a, line=line: h + a > line
+            )
+            label = f"{line:.1f}"
+
+            markets[f"Half-time over {label} (estimated)"] = over
+            markets[f"Half-time under {label} (estimated)"] = (
+                1.0 - over
+            )
+
+    # Most likely final scores.
+    score_candidates = sorted(
+        score_grid,
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+    return (
+        markets,
+        score_candidates[:5],
+        home_remaining,
+        away_remaining,
+        history_used,
+    )
 # =========================================================
 # Sidebar: history management
 # =========================================================
@@ -1249,7 +1385,32 @@ c1.metric("Home win", f"{markets['Home win']:.1%}")
 c2.metric("Draw", f"{markets['Draw']:.1%}")
 c3.metric("Away win", f"{markets['Away win']:.1%}")
 
-st.subheader("Goal and double-chance markets")
+st.subheader("Expanded market probabilities")
+
+st.caption(
+    "Probabilities are experimental model estimates, not guarantees. "
+    "Combined markets and half-time markets have not been independently "
+    "calibrated."
+)
+
+if selected["minute"] > 45:
+    st.info(
+        "Half-time markets are only displayed during the first half."
+    )
+
+market_rows = [
+    {
+        "Market": name,
+        "Probability": f"{probability:.1%}",
+    }
+    for name, probability in markets.items()
+]
+
+st.dataframe(
+    market_rows,
+    use_container_width=True,
+    hide_index=True,
+)
 st.dataframe(
     [
         {"Market": name, "Probability": f"{probability:.1%}"}
